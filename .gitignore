@@ -1,0 +1,15 @@
+# Please ignore README.md file.
+README.md
+
+# gemini-cli settings
+.gemini/
+
+# GitHub App credentials
+gha-creds-*.json
+
+# Crash log files
+crash.log
+
+# Lambda directories
+builds/
+__pycache__/
