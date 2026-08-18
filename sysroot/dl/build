@@ -1,0 +1,2764 @@
+#!/bin/bash
+
+# -e          : Exit immediately if a command exits with a non-zero status.
+# -u          : Treat unset variables as an error.
+# -o pipefail : Return the exit status of the first failed command in a pipeline.
+# -x          : Print each command before execution for debugging.
+set -e -u -o pipefail -x
+
+# Toybox : all-in-one Linux command line.
+# LiteOS : Minimal Linux-based Operating System.
+# liteos :`toybox` + `dropbear` with `zlib` + `bash` + `kernel`
+#
+# For building LiteOS the following packages are required.
+# make            : Drives the build.
+# m4              : Macro Processor used by `autoconf`
+# bison           : Parser generator required by `elfutils`
+# flex            : Lexical analyser required by `elfutils`
+# argp-standalone : Standalone ARGument Parsing library (musl has no argp)
+# musl-fts        : File Tree Traversal library (musl has no fts)
+# musl-obstack    : Object Stack library (musl has no obstack)
+# pkg-config      : Locates libraries via .pc files.
+# zlib            : DEFLATE compression; required by `elfutils` and Linux Kernel.
+# elfutils        : ELF utilities; Required by Linux Kernel build (libelf, libdw)
+# zstd            : Zstandard compression; required by Linux Kernel image.
+
+START=$(date +%s)
+
+# Define the build workspace ─ 'path' is critical for the build process.
+# Note: '/var/tmp/' is available on most Linux distributions.
+ALPINE="/var/tmp/alpine"
+SYSROOT="/var/tmp/sysroot"
+BIN="$SYSROOT/bin"
+DL="$SYSROOT/dl"
+INCLUDE="$SYSROOT/include"
+LIB="$SYSROOT/lib"
+SHARE="$SYSROOT/share"
+
+##export PATH=/var/tmp/sysroot/bin:$PATH
+
+die() { echo "$@" >&2; exit 1; }
+
+for dir in "$BIN" "$DL" "$INCLUDE" "$LIB" "$SHARE"; do [ -d "$dir" ] || mkdir -p "$dir" || exit 1; done
+
+[[ ":$PATH:" == *":$BIN:"* ]] || export PATH="$BIN:$PATH" || die "Unable to add '$BIN' to the 'PATH' environment variable"
+
+_mk_build_swap() {
+  swp="/build_swap"
+  siz="1G"
+  [ -f "$swp" ] && swapon --show=NAME | grep -q "^$swp$" && return
+  des="Temporary swap file to prevent OOM kills during heavy builds"
+
+  [ -f "$swp" ] || \
+  sudo fallocate -l "$siz" "$swp" || \
+  sudo dd if=/dev/zero of="$swp" bs=1M count=4096 || \
+  die "Failed to create swap file '$swp'"
+
+  sudo chmod 600 "$swp" || die "Unable to set permissions on '$swp'"
+  sudo mkswap "$swp" || die "Unable to initialize swap area on '$swp'"
+  sudo swapon "$swp" || die "Unable to enable swap file '$swp'"
+
+  grep -qF "$swp" /etc/fstab || \
+  echo "$swp none swap sw 0 0" | sudo tee -a /etc/fstab >/dev/null || \
+  die "Unable to add '$swp' to /etc/fstab"
+}
+
+_rm_build_swap() {
+  swp="/build_swap"
+  swapon --show=NAME | grep -q "^$swp$" || return
+  sudo swapoff "$swp" || die "Unable to disable swap file '$swp'"
+  sudo sed -i "\|^$swp |d" /etc/fstab || die "Unable to remove '$swp' from '/etc/fstab'"
+  sudo rm -f "$swp" || die "Unable to remove swap file '$swp'"
+}
+
+# Install Docker Engine from static binaries.
+# curl -skLSJO https://download.docker.com/linux/static/stable/x86_64/docker-29.6.2.tgz
+_setup_docker() {
+  [ -f "$BIN/containerd" ] && [ -f "$BIN/containerd-shim-runc-v2" ] && [ -f "$BIN/docker" ] && [ -f "$BIN/docker-proxy" ] && [ -f "$BIN/dockerd" ] && [ -f "$BIN/runc" ] && return
+  app="docker"
+  ver="29.6.2"
+  pkg="${app}-${ver}"
+  ext="tgz"
+  arc="x86_64"
+  url="https://download.docker.com/linux/static/stable/${arc}/${pkg}.${ext}"
+  des="Docker Engine static binaries"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '${pkg}.${ext}'"
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '${pkg}.${ext}' into '$DL'"
+  for tool in containerd containerd-shim-runc-v2 docker docker-proxy dockerd runc; do mv "$DL/$app/$tool" "$BIN"; done
+  rm -rf "$DL/$app" || die "Unable to remove '$DL/$app'"
+}
+
+# Docker Engine rootless extras — support for unprivileged mode.
+# curl -skLSJO https://download.docker.com/linux/static/stable/x86_64/docker-rootless-extras-29.6.2.tgz
+_setup_docker_rootless() {
+  systemctl --quiet --user is-active docker && return
+  app="docker-rootless-extras"
+  ver="29.6.2"
+  pkg="${app}-${ver}"
+  ext="tgz"
+  arc="x86_64"
+  url="https://download.docker.com/linux/static/stable/${arc}/${pkg}.${ext}"
+  des="Docker Engine rootless extras to support unprivileged mode"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '${pkg}.${ext}'"
+  rm -rf "$DL/$app"
+  tar -xf "$DL/$pkg.$ext" -C "$DL/" || die "Unable to extract '${pkg}.${ext}' into '$DL'"
+  for tool in dockerd-rootless-setuptool.sh dockerd-rootless.sh rootlesskit; do mv "$DL/$app/$tool" "$BIN"; done
+
+  sudo apt-get --yes update || die "Unable to update the ubuntu package index."
+  sudo apt-get --yes install uidmap dbus-user-session slirp4netns qemu-system-x86 || die "Unable to install the Docker dependent packages."
+  sudo modprobe nf_tables || die "Unable to load the Netfilter tables Kernel module."
+
+  # Grant rootlesskit permission to create user namespaces under AppArmor's
+  # restricted-unprivileged-userns policy (Ubuntu 23.10+); required for rootless Docker to start.
+  cat <<'EoDRK' | sudo tee "/etc/apparmor.d/docker.rootlesskit" >/dev/null || die "Unable to create '/etc/apparmor.d/docker.rootlesskit'"
+abi <abi/4.0>,
+include <tunables/global>
+/var/tmp/sysroot/bin/rootlesskit flags=(unconfined) {
+  userns,
+  include if exists <local/docker.rootlesskit>
+}
+EoDRK
+
+  sudo systemctl restart apparmor.service || die "Unable to restart AppArmor to apply the updated security profiles."
+
+  "$BIN/dockerd-rootless-setuptool.sh" install || die "Unable to run '$BIN/dockerd-rootless-setuptool.sh'"
+  systemctl --user enable docker || die "Unable to enable the Docker user service."
+  systemctl --user start docker  || die "Unable to start the Docker user service."
+  export DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
+  rm -rf "$DL/$app" || die "Unable to remove '$DL/$app'"
+}
+
+# Build LiteOS in a Docker container.
+# Note: Download the required packages manually to avoid failures in the build script.
+# curl -skLSJO https://landley.net/toybox/downloads/toybox-0.8.13.tar.gz
+# curl -skLSJO https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.79.tar.xz
+# curl -skLSJO https://www.zlib.net/fossils/zlib-1.3.1.tar.gz
+# curl -skLSJO https://matt.ucc.asn.au/dropbear/releases/dropbear-2026.94.tar.bz2
+# curl -skLSJO https://mirror.dropbear.nl/mirror/releases/dropbear-2026.94.tar.bz2
+# curl -skLSJO https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz
+_lite_os_inn_docker() {
+  # Toybox, Linux Kernel, Zlib and Dropbear, Bash package details.
+  toybox_tar="toybox-0.8.13.tar.gz"
+  linux_tar="linux-6.12.79.tar.xz"
+  zlib_tar="zlib-1.3.2.tar.gz"
+  dropbear_tar="dropbear-2026.94.tar.bz2"
+  bash_tar="bash-5.3.tar.gz"
+
+  [ -f "$DL/$toybox_tar" ] || \
+  curl -skLSJ "https://landley.net/toybox/downloads/$toybox_tar" -o "$DL/$toybox_tar" || \
+  die "Unable to download '$toybox_tar'"
+
+  [ -f "$DL/$linux_tar" ] || \
+  curl -skLSJ "https://cdn.kernel.org/pub/linux/kernel/v6.x/$linux_tar" -o "$DL/$linux_tar" || \
+  die "Unable to download '$linux_tar'"
+
+  [ -f "$DL/$zlib_tar" ] || \
+  curl -skLSJ "https://www.zlib.net/fossils/$zlib_tar" -o "$DL/$zlib_tar" || \
+  die "Unable to download '$zlib_tar'"
+
+  [ -f "$DL/$dropbear_tar" ] || \
+  curl -skLSJ "https://mirror.dropbear.nl/mirror/releases/$dropbear_tar" -o "$DL/$dropbear_tar" || \
+  die "Unable to download '$dropbear_tar'"
+
+  [ -f "$DL/$bash_tar" ] || \
+  curl -skLSJ "https://ftp.gnu.org/gnu/bash/$bash_tar" -o "$DL/$bash_tar" || \
+  die "Unable to download '$bash_tar'"
+
+  # Remove existing LiteOS build.
+  rm -rf "$DL/LiteOS" || die "Unable to remove existing '$DL/LiteOS'"
+
+  # Create the LiteOS directory for Docker volume mapping.
+  mkdir -p "$DL/LiteOS" || die "Unable to create the '$DL/LiteOS' directory for Docker volume mapping."
+
+  # Build an image from a Dockerfile
+  # Build the Toybox 0.8.13 Docker image from stdin using the current directory as build context.
+  docker image build --tag toybox:0.8.13 --file - . <<'EoD' || die "Unable to build the Toybox Docker image."
+# Use an official Ubuntu 24.04 base image.
+FROM ubuntu:24.04
+
+# Disable interactive prompts during package install.
+# Set default timezone.
+# Remove timestamp noise in 'toybox source > .config'
+# Set 'vi' as the default editor.
+# Set '/var/tmp/sysroot/dl' as working direcotry
+ENV DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC KCONFIG_NOTIMESTAMP=1 EDITOR=vi DL="/var/tmp/sysroot/dl"
+
+# Docker image metadata.
+LABEL \
+  org.opencontainers.image.authors="Balaji Pothula - balan.pothula@gmail.com" \
+  org.opencontainers.image.vendor="Siv. Sol. Pvt. Ltd." \
+  org.opencontainers.image.base.name="ubuntu:24.04" \
+  org.opencontainers.image.title="toybox" \
+  org.opencontainers.image.version="0.8.13" \
+  org.opencontainers.image.description="Toybox: all-in-one Linux command line"
+
+# Install required toybox and kernel build dependencies.
+RUN \
+  apt-get --yes update >/dev/null && \
+  apt-get --yes install --no-install-recommends bc bison build-essential ca-certificates \
+    cpio erofs-utils flex libelf-dev libssl-dev patch wget xz-utils zstd  >/dev/null && \
+  rm -rf /var/lib/apt/lists/*
+
+# Set /var/tmp/sysroot/dl/ as the working directory.
+WORKDIR ${DL}/
+
+# Copy essential source tarballs into '/var/tmp/sysroot/dl/'
+COPY toybox-0.8.13.tar.gz linux-6.12.79.tar.xz zlib-1.3.2.tar.gz \
+  dropbear-2026.94.tar.bz2 build_lite_os.sh bash-5.3.tar.gz gnubash ${DL}/
+
+# Make the 'LiteOS' build script executable.
+RUN chmod +x ${DL}/build_lite_os.sh ${DL}/gnubash
+EoD
+
+  # Remove one or more containers.
+  # Remove the existing build container to start a fresh build.
+  docker container remove --force lite_os_builder >/dev/null 2>&1 || true
+
+  # Create and run a new container from an image.
+  # Create and run Toybox build container with output bind mount.
+  docker container run --name lite_os_builder --hostname lite-os-builder --interactive --tty --detach --mount "type=bind,source=$DL/LiteOS,target=$DL/LiteOS" toybox:0.8.13 >/dev/null || die "Unable to create and run Toybox build container."
+
+  # Execute a command in a running container.
+  # Open interactive bash shell inside lite_os_builder container.
+  docker container exec --interactive --tty lite_os_builder bash "$DL/build_lite_os.sh" >/dev/null || die "Unable to execute '$DL/build_lite_os.sh' in the builder container."
+
+  # Remove one or more containers.
+  # Remove the existing build container to start a fresh build.
+  docker container remove --force lite_os_builder >/dev/null 2>&1 || true
+}
+
+# Download Alpine Linux minirootfs and add `bash` `coreutils`
+# curl -skLSJO https://dl-cdn.alpinelinux.org/v3.22/releases/x86_64/alpine-minirootfs-3.22.5-x86_64.tar.gz
+# curl -skLSJO https://dl-cdn.alpinelinux.org/v3.24/releases/x86_64/alpine-minirootfs-3.24.1-x86_64.tar.gz
+# sudo chroot "/var/tmp/alpine" /bin/sh
+_dl_alpine() {
+  [ -d "$ALPINE" ] && [ -f "$ALPINE/sbin/apk" ] && return
+  app="alpine-minirootfs"
+  ver="3.22"
+  rel="5"
+  arc="x86_64"
+  pkg="${app}-${ver}.${rel}-${arc}"
+  ext="tar.gz"
+  url="https://dl-cdn.alpinelinux.org/v$ver/releases/$arc/$pkg.$ext"
+  des="Alpine Linux is a security-oriented, lightweight Linux distribution based on musl libc and busybox"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  mkdir -p "$ALPINE" || die "Unable to create '$ALPINE' directory."
+  tar -xf "$DL/$pkg.$ext" -C "$ALPINE" >/dev/null || die "Unable to extract '$DL/$pkg.$ext' into '$ALPINE'"
+}
+
+# Download static bubblewrap (bwrap.static) — unprivileged sandboxing tool.
+# https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/bubblewrap-static-0.11.2-r0.apk
+_dl_bwrap() {
+  [ -f "$BIN/bwrap.static" ] && return
+  app="bubblewrap-static"
+  ver="0.11.2"
+  rel="r0"
+  pkg="${app}-${ver}-${rel}"
+  ext="apk"
+  arc="x86_64"
+  osn="alpine"
+  osv="3.24"
+  url="https://dl-cdn.alpinelinux.org/${osn}/v${osv}/main/${arc}/${pkg}.${ext}"
+  des="Unprivileged sandboxing tool"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '${pkg}.${ext}'"
+  tar -xf "$DL/$pkg.$ext" -C "$BIN" --strip-components=2 usr/bin/bwrap.static 2>/dev/null || die "Unable to extract '$DL/$pkg.$ext' into '$BIN'"
+}
+
+# Build LiteOS inside a Bubblewrap sandbox environment.
+# Note: Download the required packages manually to avoid failures in the build script.
+# Note: Temporarily disable AppArmor's restriction on unprivileged user namespaces  until reboot.
+# sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+_inn_sandbox() {
+  # Ensure `bash` `coreutils` `file` `grep` `patch` `sed` are installed in the Alpine rootfs; install it if missing.
+  "$BIN/bwrap.static" \
+    --uid 0 \
+    --gid 0 \
+    --bind "$ALPINE" / \
+    --ro-bind /etc/resolv.conf /etc/resolv.conf \
+    --proc /proc \
+    --dev /dev \
+    /sbin/apk add --no-cache bash coreutils file grep patch sed >/dev/null || die "Unable to install the LiteOS build dependencies in Alpine."
+
+  exec "$BIN/bwrap.static" \
+    --uid "$(id -u)" \
+    --gid "$(id -g)" \
+    --chdir "$DL" \
+    --setenv BWRAP $$ \
+    --setenv PATH "/var/tmp/sysroot/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    --bind "$ALPINE" / \
+    --bind "$SYSROOT" "$SYSROOT" \
+    --ro-bind /etc/passwd /etc/passwd \
+    --ro-bind /etc/resolv.conf /etc/resolv.conf \
+    --proc /proc \
+    --dev /dev \
+    /bin/bash "$DL/build" "${@:2}" || die "Unable to build LiteOS inside the Alpine Bubblewrap sandbox."
+}
+
+# Extract Rob Landley's x86_64 linux musl-libc prebuilt cross-compiler toolchain.
+# curl -skLSJO https://landley.net/toybox/downloads/binaries/toolchains/25-03-2024/x86_64-linux-musl-cross.tar.xz
+# curl -skLSJO https://landley.net/toybox/downloads/binaries/toolchains/25-03-2024/musl-cross-make.tar.xz
+# curl -skLSJO https://github.com/richfelker/musl-cross-make/archive/refs/tags/v0.9.10.tar.gz
+_cp_tools() {
+  tools_exist=1
+  toolchain="ar as cc gcc g++ ld nm objcopy objdump ranlib readelf strip"
+  for tool in $toolchain; do [ -f "$BIN/x86_64-linux-musl-$tool" ] || tools_exist=0; done
+  [ -d "$SYSROOT/libexec" ] || tools_exist=0
+  for tool in $toolchain; do ln -sf "$BIN/x86_64-linux-musl-$tool" "$BIN/$tool" 2>/dev/null; done
+  test "$tools_exist" -eq 1 && return
+  pkg="x86_64-linux-musl-cross"
+  ext="tar.xz"
+  url="https://landley.net/toybox/downloads/binaries/toolchains/25-03-2024/$pkg.$ext"
+  des="cross compiler toolchain built from: musl 1.2.5, linux 6.8, gcc 11.2.0, binutils 2.33.1"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  tar -xf "$DL/$pkg.$ext" -C "$SYSROOT" --strip-components=1 || die "Unable to extract '$DL/$pkg.$ext' into '$SYSROOT'"
+  for tool in $toolchain; do ln -sf "$BIN/x86_64-linux-musl-$tool" "$BIN/$tool" 2>/dev/null; done
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `make`
+# Required by `bash`
+# curl -skLSJO https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz
+_make() {
+  [ -f "$BIN/make" ] && return
+  # Call `_cp_tools` function to copy Landley's toolchain.
+  _cp_tools
+  app="make"
+  ver="4.4.1"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://ftp.gnu.org/gnu/$app/$pkg.$ext"
+  des="GNU make utility to maintain groups of programs"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --infodir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --disable-option-checking \
+    --enable-silent-rules \
+    --disable-dependency-tracking \
+    --disable-nls \
+    --disable-rpath \
+    --disable-job-server \
+    --disable-load \
+    --enable-year2038 \
+    --without-libiconv-prefix \
+    --without-libintl-prefix \
+    --without-guile \
+    CC=gcc \
+    CFLAGS="-flto -fno-inline-small-functions -ffunction-sections -fdata-sections -Os -Wno-undef" \
+    LDFLAGS="-flto -Wl,--gc-sections -static" >/dev/null || die "Unable to configure '$app'"
+  sh build.sh >/dev/null || die "Unable to run '$app' build.sh script."
+  strip make || die "Unable to strip '$app' executable."
+  mv make "$BIN/make" || die "Unable to move '$app' executable to '$BIN'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build GNU `bash`
+# curl -skLSJO https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz
+_bash() {
+  [ -f "$BIN/bash" ] && return
+  # Call the `_make` function, as `bash` depends on `make`
+  _make
+  app="bash"
+  ver="5.3"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://ftp.gnu.org/gnu/$app/$pkg.$ext"
+  des="The GNU Bourne Again shell"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --datadir="$DL/$pkg" \
+    --infodir="$DL/$pkg" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --enable-alias \
+    --disable-alt-array-implementation \
+    --enable-array-variables \
+    --enable-bang-history \
+    --enable-brace-expansion \
+    --disable-casemod-attributes \
+    --disable-casemod-expansions \
+    --enable-command-timing \
+    --enable-cond-command \
+    --enable-cond-regexp \
+    --disable-coprocesses \
+    --disable-debugger \
+    --enable-directory-stack \
+    --disable-disabled-builtins \
+    --enable-dparen-arithmetic \
+    --enable-extended-glob \
+    --disable-function-import \
+    --disable-help-builtin \
+    --enable-history \
+    --enable-job-control \
+    --enable-process-substitution \
+    --enable-progcomp \
+    --enable-prompt-string-decoding \
+    --enable-readline \
+    --disable-restricted \
+    --enable-select \
+    --disable-separate-helpfiles \
+    --disable-single-help-strings \
+    --disable-translatable-strings \
+    --disable-xpg-echo-default \
+    --disable-mem-scramble \
+    --disable-profiling \
+    --enable-static-link \
+    --disable-largefile \
+    --disable-nls \
+    --disable-threads \
+    --disable-rpath \
+    --enable-year2038 \
+    --without-afs \
+    --without-bash-malloc \
+    --without-curses \
+    --without-installed-readline \
+    --with-gnu-ld \
+    --without-libiconv-prefix \
+    --without-libintl-prefix \
+    CFLAGS="-static -no-pie -fno-pie -Os -fdata-sections -ffunction-sections -Wno-implicit-function-declaration -s -std=gnu99" \
+    LDFLAGS="-static -no-pie -Wl,--gc-sections" > /dev/null || die "Unable to configure '$app'"
+  make > /dev/null || die "Unable to build '$app'"
+  strip bash || die "Unable to strip '$app' executable."
+  mv bash "$BIN/bash" || die "Unable to move '$app' executable to '$BIN'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+
+  # Replace Toybox sh with GNU BASH as system shell.
+  # Toybox sh crashes on autoconf scripts — GNU `bash` is required for building packages.
+  #ln -sf "$BIN/bash" /usr/bin/sh
+  # Symlink GNU `bash` as `bash` so scripts invoking `bash` directly work.
+  #ln -sf "$BIN/bash" /usr/bin/bash
+}
+
+# Build LibreSSL Library.
+# curl -skLSJO https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.3.2.tar.gz
+_libressl_lib() {
+  [ -d "$INCLUDE/openssl" ] && \
+  [ -f "$LIB/libssl.a" ] && \
+  [ -f "$LIB/libtls.a" ] && \
+  [ -f "$LIB/libcrypto.a" ] && return
+  app="libressl"
+  ver="4.3.2"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="http://ftp.openbsd.org/pub/OpenBSD/LibreSSL/$pkg.$ext"
+  des="Version of the TLS/crypto stack forked from OpenSSL"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --libdir="$LIB" \
+    --includedir="$INCLUDE" \
+    --datadir="$DL/$pkg" \
+    --infodir="$DL/$pkg" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --enable-silent-rules \
+    --disable-dependency-tracking \
+    --disable-shared \
+    --enable-static \
+    --disable-fast-install \
+    --disable-libtool-lock \
+    --disable-hardening \
+    --disable-tests \
+    --disable-asm \
+    --with-gnu-ld \
+    --with-sysroot="$SYSROOT" \
+    --with-openssldir="$SYSROOT" \
+    CC=gcc \
+    CFLAGS="-w -flto -Os -ffunction-sections -fdata-sections" \
+    LDFLAGS="-flto -Wl,--gc-sections -static" \
+    CPPFLAGS="-DOPENSSL_NO_ENGINE" > /dev/null || die "Unable to configure '$app'"
+  make -j"$(nproc)" LIBS="-all-static" > /dev/null || die "Unable to build '$app'"
+  cp -r include/openssl       "$INCLUDE/openssl" || die "Unable to copy '$DL/$pkg/include/openssl' into '$INCLUDE/openssl'"
+  mv ssl/.libs/libssl.a       "$LIB/libssl.a" || die "Unable to move '$DL/$pkg/ssl/.libs/libssl.a' into '$LIB/libssl.a'"
+  mv tls/.libs/libtls.a       "$LIB/libtls.a" || die "Unable to move '$DL/$pkg/tls/.libs/libtls.a' into '$LIB/libtls.a'"
+  mv crypto/.libs/libcrypto.a "$LIB/libcrypto.a" || die "Unable to move '$DL/$pkg/crypto/.libs/libcrypto.a' into '$LIB/libcrypto.a'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build libssh2 Library.
+# `libssh2` required the LibreSSL Library for the crypto backend.
+# `libssh2` provides the SFTP protocol support so `curl` can replace `scp`.
+# curl -skLSJO https://github.com/libssh2/libssh2/releases/download/libssh2-1.11.1/libssh2-1.11.1.tar.gz
+_libssh2_lib() {
+  [ -f "$INCLUDE/libssh2.h" ] && \
+  [ -f "$LIB/libssh2.a" ] && return
+  app="libssh2"
+  ver="1.11.1"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://github.com/libssh2/libssh2/releases/download/$pkg/$pkg.$ext"
+  des="Library for SSH, SCP and SFTP protocols"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --libdir="$LIB" \
+    --includedir="$INCLUDE" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --enable-silent-rules \
+    --disable-dependency-tracking \
+    --disable-shared \
+    --enable-static \
+    --disable-examples-build \
+    --with-libssl-prefix="$SYSROOT" \
+    CC=gcc \
+    CFLAGS="-Os -ffunction-sections -fdata-sections" \
+    LDFLAGS="-static" \
+    CPPFLAGS="-I$INCLUDE/openssl" > /dev/null || die "Unable to configure '$app'"
+  make -j"$(nproc)" > /dev/null || die "Unable to build '$app'"
+  cp include/libssh2.h include/libssh2_sftp.h include/libssh2_publickey.h "$INCLUDE/" || die "Unable to copy '$DL/$pkg/include/libssh2*.h' into '$INCLUDE'"
+  mv src/.libs/libssh2.a "$LIB/libssh2.a" || die "Unable to move '$DL/$pkg/src/.libs/libssh2.a' into '$LIB/libssh2.a'"
+  mkdir -p "$LIB/pkgconfig" || die "Unable to create '$LIB/pkgconfig'"
+  cp libssh2.pc "$LIB/pkgconfig/libssh2.pc" || die "Unable to copy '$DL/$pkg/libssh2.pc' into '$LIB/pkgconfig/libssh2.pc'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `curl`
+# `curl` with features AWS SigV4, HTTP Auth and SFTP
+# `curl` required SSL library for HTTPS.
+# `curl` required `perl` for building documentation, but you can ignore.
+# curl -skLSJO https://curl.se/download/curl-8.20.0.tar.xz
+_libressl_curl() {
+##[ -f "$BIN/curl" ] && return
+  # Call the `_libressl_lib` function, as `curl` depends on 'LibreSSL'
+  _libressl_lib
+  # Call the `_libssh2_lib` function, as `curl` depends on 'libssh2'
+  _libssh2_lib  
+  app="curl"
+  ver="8.20.0"
+  pkg="${app}-${ver}"
+  ext="tar.xz"
+  url="https://curl.se/download/$pkg.$ext"
+  des="URL retrieval utility and library"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --bindir="$BIN" \
+    --libdir="$LIB" \
+    --includedir="$INCLUDE" \
+    --datadir="$DL/$pkg" \
+    --infodir="$DL/$pkg" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --enable-silent-rules \
+    --disable-debug \
+    --disable-ares \
+    --disable-httpsrr \
+    --disable-ech \
+    --disable-ssls-export \
+    --disable-dependency-tracking \
+    --disable-largefile \
+    --disable-shared \
+    --enable-static \
+    --disable-fast-install \
+    --disable-ftp \
+    --disable-file \
+    --disable-ipfs \
+    --disable-ldap \
+    --disable-ldaps \
+    --disable-rtsp \
+    --disable-proxy \
+    --disable-dict \
+    --disable-telnet \
+    --disable-tftp \
+    --disable-pop3 \
+    --disable-imap \
+    --disable-smb \
+    --disable-smtp \
+    --disable-gopher \
+    --disable-mqtt \
+    --disable-manual \
+    --disable-docs \
+    --disable-libcurl-option \
+    --disable-ipv6 \
+    --disable-openssl-auto-load-config \
+    --disable-versioned-symbols \
+    --disable-threaded-resolver \
+    --disable-typecheck \
+    --disable-verbose \
+    --disable-sspi \
+    --disable-basic-auth \
+    --disable-bearer-auth \
+    --disable-digest-auth \
+    --disable-kerberos-auth \
+    --disable-negotiate-auth \
+    --enable-aws \
+    --disable-ntlm \
+    --disable-tls-srp \
+    --disable-unix-sockets \
+    --disable-cookies \
+    --disable-socketpair \
+    --enable-http-auth \
+    --disable-doh \
+    --disable-mime \
+    --disable-bindlocal \
+    --disable-form-api \
+    --disable-dateparse \
+    --disable-netrc \
+    --disable-progress-meter \
+    --disable-sha512-256 \
+    --disable-dnsshuffle \
+    --disable-get-easy-options \
+    --disable-alt-svc \
+    --disable-headers-api \
+    --disable-hsts \
+    --disable-websockets \
+    --with-openssl="$SYSROOT" \
+    --without-gnutls \
+    --without-mbedtls \
+    --without-wolfssl \
+    --with-gnu-ld \
+    --without-zlib \
+    --without-brotli \
+    --without-zstd \
+    --without-ca-bundle \
+    --without-ca-path \
+    --with-ca-fallback \
+    --without-libpsl \
+    --without-libgsasl \
+    --with-libssh2="$SYSROOT" \
+    --without-winidn \
+    --without-libidn2 \
+    --without-nghttp2 \
+    CC=gcc \
+    CFLAGS="-Os -ffunction-sections -fdata-sections -Wno-implicit-function-declaration" \
+    LDFLAGS="-static -Wl,--gc-sections -L$LIB" \
+    LIBS="-lssh2 -lssl -lcrypto -lz -lpthread" \
+    CPPFLAGS="-I$INCLUDE/openssl" \
+    AR=ar \
+    RANLIB=ranlib \
+    STRIP=strip \
+    PKG_CONFIG_PATH="$LIB/pkgconfig" \
+    PKG_CONFIG="pkg-config --static" > /dev/null || die "Unable to configure '$app'"
+  make \
+    -j"$(nproc)" \
+    LDFLAGS="-static -all-static -L$LIB" \
+    CURL_LDFLAGS="-static -all-static" > /dev/null || die "Unable to build '$app'"
+  strip src/curl || die "Unable to strip '$app' executable."
+  mv src/curl "$BIN/curl" || die "Unable to move '$app' executable to '$BIN'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+
+# Build `xmake`
+# NOTE: Do not download the source tarball, because GitHub does not automatically package submodules.
+# git clone --recursive --branch v3.0.9 --depth 1 https://github.com/xmake-io/xmake.git xmake-3.0.9
+# NOTE: After git clone, archieve the source, and copy into builder machine.
+# tar -c -z -f $(pwd)/xmake-3.0.9.tar.gz -C $(pwd) xmake-3.0.9
+_xmake() {
+  [ -f "$BIN/xmake" ] && return
+  # Call the `_make` function, as `bash` depends on `make`
+  _make
+  # Stage 1 — Build dynamic `xmake` using `make`
+  app="xmake"
+  ver="3.0.9"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  des="A cross-platform build utility based on Lua"
+##[ -f "$DL/$pkg.$ext" ] || git clone --recursive -b v$ver --depth 1 https://github.com/xmake-io/xmake.git $pkg || exit 1
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --generator='gmake' \
+    --make="$BIN/make" \
+    --plat='linux' \
+    --arch='x86_64' \
+    --mode='release' \
+    --kind='static' \
+    --toolchain='gcc' \
+    --builddir='build' \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --prefix="$SYSROOT" \
+    --bindir="$BIN" \
+    --libdir="$LIB" \
+    --includedir="$INCLUDE" \
+    --runtime='lua' \
+    --external='no' > /dev/null || die "Unable to configure '$app'"
+  sed -i 's|cli_ldflags= |cli_ldflags= -static |' Makefile
+  make -j "$(nproc)" > /dev/null || die "Unable to build '$app'"
+  make install > /dev/null || die "Unable to install '$app'"
+  # Stage 2 — Rebuild static + embedded `xmake` using `xmake`
+  cd "$DL/$pkg/core" || die "Unable to switch to '$DL/$pkg/core' source tree."
+  "$BIN/xmake" config \
+    --root \
+    --clean \
+    --plat='linux' \
+    --arch='x86_64' \
+    --mode='release' \
+    --kind='static' \
+    --policies='check.auto_ignore_flags:y' \
+    --cross='x86_64-linux-musl-' \
+    --bin="$BIN" \
+    --sdk="$SYSROOT" \
+    --toolchain='gcc' \
+    --cxx="$BIN/g++" \
+    --ld="$BIN/gcc" \
+    --ar="$BIN/ar" \
+    --ranlib="$BIN/ranlib" \
+    --cxxflags='-Os -static -ffunction-sections -fdata-sections -fno-pie -no-pie -w' \
+    --ldflags='-static -no-pie -Wl,--gc-sections' \
+    --cc="$BIN/gcc" \
+    --cflags='-Os -static -ffunction-sections -fdata-sections -fno-pie -no-pie -w' \
+    --ccache=n \
+    --builddir="$DL/$pkg/core/build" \
+    --embed=y \
+    --runtime='lua' \
+    --tbox::small=y \
+    --tbox::micro=n \
+    --tbox::database=n \
+    --tbox::zip=n \
+    --tbox::hash=y \
+    --tbox::xml=n \
+    --tbox::regex=n \
+    --tbox::charset=y \
+    --tbox::coroutine=y \
+    --tbox::object=n \
+    --tbox::float=y \
+    --tbox::deprecated=n \
+    --tbox::exception=n \
+    --tbox::demo=n \
+    --tbox::info=n \
+    --tbox::force-utf8=n \
+    --tbox::cosmocc=n \
+    --tbox::polarssl=n \
+    --tbox::openssl=n \
+    --tbox::zlib=n \
+    --tbox::mysql=n \
+    --tbox::pcre=n \
+    --tbox::pcre2=n \
+    --tbox::mbedtls=n \
+    --tbox::sqlite3=n \
+    --lua_cjson=n \
+    --pdcurses=n \
+    --curses=n \
+    --onlylib=n > /dev/null || die "Unable to configure '$app'"
+  "$BIN/xmake" --root -j "$(nproc)" > /dev/null || die "Unable to build static '$app'"
+  mv build/xmake "$BIN/xmake" || die "Unable to move '$app' executable to '$BIN'"
+  rm -rf "$BIN/xrepo" || die "Unable to remove '$BIN/xrepo'"
+  rm -rf "$SHARE/$app" || die "Unable to remove '$SHARE/$app'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build GNU `m4`
+# Required by `autoconf` `bison` `flex`
+# curl -skLSJO https://ftp.gnu.org/gnu/m4/m4-1.4.21.tar.xz
+_m4() {
+  [ -f "$BIN/m4" ] && return
+  app="m4"
+  ver="1.4.21"
+  pkg="${app}-${ver}"
+  ext="tar.xz"
+  url="https://ftp.gnu.org/gnu/$app/$pkg.$ext"
+  des="GNU macro processor"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg"|| die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --datadir="$DL/$pkg" \
+    --infodir="$DL/$pkg" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --enable-silent-rules \
+    --disable-dependency-tracking \
+    --disable-largefile \
+    --disable-threads \
+    --enable-cross-guesses='risky' \
+    --disable-assert \
+    --disable-rpath \
+    --disable-nls \
+    --enable-year2038 \
+    --without-libsigsegv \
+    --with-gnu-ld \
+    --without-libsigsegv-prefix \
+    --without-libiconv-prefix \
+    --with-syscmd-shell="/bin/sh" \
+    --without-libintl-prefix \
+    CC=gcc \
+    CFLAGS="-Os -ffunction-sections -fdata-sections -w" \
+    LDFLAGS="-static -Wl,--gc-sections" \
+    LIBS='-lm -lc' > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" > /dev/null || die "Unable to build '$app'"
+  strip src/m4 || die "Unable to strip '$app' executable."
+  mv src/m4 "$BIN/m4" || die "Unable to move '$app' executable to '$BIN'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build GNU `bison`
+# Depends on `m4`
+# Required by `flex`, `elfutils`, and `linux`
+# curl -skLSJO https://ftp.gnu.org/gnu/bison/bison-3.8.2.tar.xz
+_bison() {
+  [ -f "$BIN/bison" ] && [ -d "$SHARE/bison" ] && return
+  app="bison"
+  ver="3.8.2"
+  pkg="${app}-${ver}"
+  ext="tar.xz"
+  url="https://ftp.gnu.org/gnu/$app/$pkg.$ext"
+  des="The GNU general-purpose parser generator"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --datadir="$SHARE" \
+    --infodir="$DL/$pkg/tmp" \
+    --localedir="$DL/$pkg/tmp" \
+    --mandir="$DL/$pkg/tmp" \
+    --docdir="$DL/$pkg/tmp" \
+    --htmldir="$DL/$pkg/tmp" \
+    --dvidir="$DL/$pkg/tmp" \
+    --pdfdir="$DL/$pkg/tmp" \
+    --psdir="$DL/$pkg/tmp" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --enable-silent-rules \
+    --disable-dependency-tracking \
+    --disable-largefile \
+    --disable-threads \
+    --disable-rpath \
+    --disable-yacc \
+    --enable-cross-guesses='risky' \
+    --disable-assert \
+    --disable-nls \
+    --with-gnu-ld \
+    --without-libtextstyle-prefix \
+    --without-libiconv-prefix \
+    --without-libreadline-prefix \
+    --without-libintl-prefix \
+    CC=gcc \
+    CFLAGS="-Os -ffunction-sections -fdata-sections -w" \
+    LDFLAGS="-static -Wl,--gc-sections" \
+    LIBS='-lm -lc' \
+    M4="$BIN/m4" > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" > /dev/null || die "Unable to build '$app'"
+  strip src/bison || die "Unable to strip '$app' executable."
+  make install > /dev/null || die "Unable to install '$app'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `flex`
+# Depends on `m4`
+# Required by `flex` `elfutils` `linux`
+# Note: `flex` bootstraps itself using its own generated scanner `scan.l`
+# Note: `flex` always expects `gcc` by name
+# curl -skLSJO https://github.com/westes/flex/releases/download/v2.6.4/flex-2.6.4.tar.gz
+_flex() {
+  [ -f "$BIN/flex" ] && return
+  app="flex"
+  ver="2.6.4"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://github.com/westes/$app/releases/download/v$ver/$pkg.$ext"
+  des="A tool for generating text-scanning programs"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --datadir="$DL/$pkg" \
+    --infodir="$DL/$pkg" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --disable-shared \
+    --enable-static \
+    --disable-fast-install \
+    --disable-libtool-lock \
+    --disable-dependency-tracking \
+    --enable-silent-rules \
+    --disable-nls \
+    --disable-rpath \
+    --disable-libfl \
+    --disable-bootstrap \
+    --with-gnu-ld \
+    --with-sysroot="$SYSROOT" \
+    --without-libiconv-prefix \
+    --without-libintl-prefix \
+    CC=gcc \
+    CFLAGS="-Os -ffunction-sections -fdata-sections -w" \
+    LDFLAGS="-static -Wl,--gc-sections" \
+    LIBS='-lm -lc' \
+    YACC="$BIN/bison -y" > /dev/null || die "Unable to configure '$app'"
+  sed -i 's|./stage1flex$(EXEEXT).*scan.l|@echo "Skipping"|' src/Makefile
+  cp src/scan.c src/stage1scan.c
+  make -j1 CC=gcc LDFLAGS='-all-static' > /dev/null || die "Unable to build '$app'"
+  strip src/flex || die "Unable to strip '$app' executable."
+  mv src/flex "$BIN/flex" || die "Unable to move '$app' executable to '$BIN'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `argp-standalone`
+# Note: GNU argp argument parsing library for musl libc.
+# Note: musl libc intentionally omits argp; this standalone version fills the gap.
+# libargp.a : required by elfutils (libelf, libdw) which is required by Linux Kernel build.
+# curl -skLSJO https://github.com/argp-standalone/argp-standalone/archive/refs/tags/1.5.0.tar.gz
+_argp_standalone() {
+  [ -f "$LIB/libargp.a" ] && [ -f "$INCLUDE/argp.h" ] && return
+  app="argp-standalone"
+  ver="1.5.0"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://github.com/argp-standalone/$app/archive/refs/tags/$ver.$ext"
+  des="Hierarchial argument parsing library broken out from glibc"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  gcc -static -Os -ffunction-sections -fdata-sections -fno-pie -no-pie -w \
+    -I. -DUNUSED='__attribute__((unused))' \
+    -c argp-ba.c argp-eexst.c argp-fmtstream.c argp-help.c \
+    argp-parse.c argp-pv.c argp-pvh.c mempcpy.c strchrnul.c strndup.c > /dev/null || die "Unable to build '$app'"
+  ar rcs "$LIB/libargp.a" \
+    argp-ba.o argp-eexst.o argp-fmtstream.o argp-help.o \
+    argp-parse.o argp-pv.o argp-pvh.o mempcpy.o strchrnul.o strndup.o > /dev/null || die "Unable to build '$LIB/libargp.a'"
+  mv argp.h "$INCLUDE/argp.h" || die "Unable to move 'argp.h' headerfile to '$INCLUDE/argp.h'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `musl-fts` — File Tree Traversal library for musl libc
+# Note: musl libc intentionally omits fts; this standalone version fills the gap.
+# libfts.a : required by `elfutils` (libelf, libdw) which is required by Linux Kernel build.
+# curl -skLSJO https://github.com/void-linux/musl-fts/archive/refs/tags/v1.2.7.tar.gz
+_musl_fts() {
+  [ -f "$LIB/libfts.a" ] && [ -f "$INCLUDE/fts.h" ] && return
+  app="musl-fts"
+  ver="1.2.7"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://github.com/void-linux/$app/archive/refs/tags/v$ver.$ext"
+  des="fts(3) functions, which are missing in musl libc"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  echo '#define HAVE_DIRFD 1' > config.h
+  gcc -static -Os -ffunction-sections -fdata-sections -fno-pie -no-pie -w -I. -c fts.c > /dev/null || die "Unable to build '$app'"
+  ar rcs "$LIB/libfts.a" fts.o > /dev/null || die "Unable to build '$LIB/libfts.a'"
+  mv fts.h "$INCLUDE/fts.h" || die "Unable to move 'fts.h' headerfile to '$INCLUDE/fts.h'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `musl-obstack` — Memory Object Stack library for musl libc.
+# Required by `elfutils`
+# Note: musl libc intentionally omits obstack; this standalone version fills the gap.
+# libobstack.a : required by `elfutils` (libelf, libdw) which is required by Linux Kernel build.
+# curl -skLSJO https://github.com/void-linux/musl-obstack/archive/refs/tags/v1.2.3.tar.gz
+_musl_obstack() {
+  [ -f "$LIB/libobstack.a" ] && [ -f "$INCLUDE/obstack.h" ] && return
+  app="musl-obstack"
+  ver="1.2.3"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://github.com/void-linux/$app/archive/refs/tags/v$ver.$ext"
+  des="Standalone library to implement GNU libc's obstack"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  echo '#define HAVE_INTTYPES_H 1' > config.h
+  gcc -static -Os -ffunction-sections -fdata-sections -fno-pie -no-pie -w -I. -c obstack.c obstack_printf.c > /dev/null || die "Unable to build '$app'"
+  ar rcs "$LIB/libobstack.a" obstack.o obstack_printf.o > /dev/null || die "Unable to build '$LIB/libobstack.a'"
+  mv obstack.h "$INCLUDE/obstack.h" || die "Unable to move 'obstack.h' headerfile to '$INCLUDE/obstack.h'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `pkg-config`
+# Required by `erofs-utils`
+# Note: `erofs-utils` configure script to locate libuuid.a via pkg-config
+# curl -skLSJO https://pkgconfig.freedesktop.org/releases/pkg-config-0.29.2.tar.gz
+_pkg_config() {
+  [ -f "$BIN/pkg-config" ] && [ -f "$SHARE/aclocal/pkg.m4" ] && return
+  app="pkg-config"
+  ver="0.29.2"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://pkgconfig.freedesktop.org/releases/$pkg.$ext"
+  des="A helper tool used when compiling applications and libraries"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --datadir="$DL/$pkg" \
+    --infodir="$DL/$pkg" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --enable-silent-rules \
+    --disable-shared \
+    --enable-static \
+    --disable-fast-install \
+    --disable-dependency-tracking \
+    --disable-libtool-lock \
+    --disable-largefile \
+    --disable-indirect-deps \
+    --disable-host-tool \
+    --with-gnu-ld \
+    --with-sysroot="$SYSROOT" \
+    --with-pc-path="$LIB/pkgconfig" \
+    --with-system-include-path="$INCLUDE" \
+    --with-system-library-path="$LIB" \
+    --with-internal-glib \
+    CC=gcc \
+    CFLAGS="-Os -ffunction-sections -fdata-sections -w" \
+    LDFLAGS="-static -static-libgcc -Wl,--gc-sections" \
+    LIBS='-lm -lc' \
+    PKG_CONFIG="$BIN/pkg-config" \
+    PKG_CONFIG_PATH="$LIB/pkgconfig" \
+    PKG_CONFIG_LIBDIR="$LIB/pkgconfig" > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" LDFLAGS='-all-static' > /dev/null || die "Unable to build '$app'"
+  strip pkg-config || die "Unable to strip '$app' executable."
+  mv pkg-config "$BIN/pkg-config" || die "Unable to move '$app' executable to '$BIN'"
+  # Note: `pkg.m4` required for building `erofs-utils` (`mkfs.erofs`), NOT for ToyOS.
+  mkdir -p "$SHARE/aclocal" || die "Unable to create '$SHARE/aclocal'"
+  mv pkg.m4 "$SHARE/aclocal/pkg.m4" || die "Unable to move 'pkg.m4' to '$SHARE/aclocal/pkg.m4'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `zlib`
+# Required by `erofs-utils` `libelf` `linux`
+# curl -skLSJO https://zlib.net/zlib-1.3.2.tar.gz
+_zlib() {
+  [ -f "$LIB/libz.a" ] && [ -f "$INCLUDE/zlib.h" ] && [ -f "$INCLUDE/zconf.h" ] && return
+  app="zlib"
+  ver="1.3.2"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://zlib.net/$pkg.$ext"
+  des="A compression/decompression Library"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --const \
+    --prefix="$SYSROOT" \
+    --static \
+    --64 \
+    --libdir="$LIB" \
+    --includedir="$INCLUDE" \
+    --mandir="$DL/$pkg" > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" \
+    CFLAGS="-Os -ffunction-sections -fdata-sections -w -fPIC" \
+    LDFLAGS="-static -Wl,--gc-sections" \
+    AR=ar > /dev/null || die "Unable to build '$app'"
+  make install > /dev/null || die "Unable to install '$app'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `elfutils` - ELF (Executable and Linkable Format) utilities and libraries.
+# Depends on `libelf`
+# Required by argp-standalone, linux, musl-fts, musl-obstack
+# libelf.a : Required by Linux Kernel build host tools.
+# Note: Requires to fill musl libc gaps.
+# curl -skLSJO https://sourceware.org/elfutils/ftp/0.195/elfutils-0.195.tar.bz2
+_elfutils() {
+  [ -f "$LIB/libelf.a" ] && \
+  [ -f "$INCLUDE/libelf.h" ] && \
+  [ -f "$INCLUDE/elf.h" ] && \
+  [ -f "$INCLUDE/gelf.h" ] && \
+  [ -f "$INCLUDE/nlist.h" ] && \
+  return
+  app="elfutils"
+  ver="0.195"
+  pkg="${app}-${ver}"
+  ext="tar.bz2"
+  url="https://sourceware.org/$app/ftp/$ver/$pkg.$ext"
+  des="A collection of utilities and libraries for working with ELF binaries, DWARF debug data, symbols, and core files on GNU/Linux"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xjf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --libdir="$LIB" \
+    --includedir="$INCLUDE" \
+    --datadir="$DL/$pkg" \
+    --infodir="$DL/$pkg" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --enable-silent-rules \
+    --enable-deterministic-archives \
+    --disable-thread-safety \
+    --disable-dependency-tracking \
+    --disable-largefile \
+    --disable-debugpred \
+    --disable-gprof \
+    --disable-gcov \
+    --disable-sanitize-undefined \
+    --disable-sanitize-address \
+    --disable-helgrind \
+    --disable-valgrind \
+    --disable-valgrind-annotations \
+    --disable-tests-rpath \
+    --disable-demangler \
+    --disable-textrelcheck \
+    --disable-symbol-versioning \
+    --disable-nls \
+    --disable-rpath \
+    --disable-libdebuginfod \
+    --disable-debuginfod \
+    --disable-stacktrace \
+    --enable-year2038 \
+    --without-valgrind \
+    --with-zlib \
+    --without-bzlib \
+    --without-lzma \
+    --without-zstd \
+    --with-gnu-ld \
+    --without-libiconv-prefix \
+    --without-libintl-prefix \
+    --without-libarchive \
+    CC=gcc \
+    CFLAGS="-Os -ffunction-sections -fdata-sections -w -I$INCLUDE" \
+    LDFLAGS="-static -Wl,--gc-sections -L$LIB" \
+    LIBS='-lfts -lobstack -largp' \
+    YACC="$BIN/bison -y" \
+    PKG_CONFIG="$BIN/pkg-config" \
+    PKG_CONFIG_PATH="$LIB/pkgconfig" \
+    PKG_CONFIG_LIBDIR="$LIB/pkgconfig" \
+    CPPFLAGS="-I$INCLUDE" > /dev/null || die "Unable to configure '$app'"
+  make --directory=lib -j "$(nproc)" > /dev/null || die "Unable to build 'lib'"
+  make --directory=libelf -j "$(nproc)" > /dev/null || die "Unable to build 'libelf'"
+  mv libelf/libelf.a "$LIB/libelf.a" || die "Unable to move '$DL/$pkg/libelf/libelf.a' static lib to '$LIB'"
+  mv libelf/libelf.h "$INCLUDE" || die "Unable to move '$DL/$pkg/libelf/libelf.h' header file to '$INCLUDE'"
+  mv libelf/elf.h    "$INCLUDE" || die "Unable to move '$DL/$pkg/libelf/elf.h' header file to '$INCLUDE'"
+  mv libelf/gelf.h   "$INCLUDE" || die "Unable to move '$DL/$pkg/libelf/gelf.h' header file to '$INCLUDE'"
+  mv libelf/nlist.h  "$INCLUDE" || die "Unable to move '$DL/$pkg/libelf/nlist.h' header file to '$INCLUDE'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `zstd` — Required by Linux kernel (CONFIG_KERNEL_ZSTD image compression)
+# `libzstd.a`  — Required by `erofs-utils` (image compression)
+# Note: zstd's Makefile uses GNU extensions incompatible with our static make, so compile directly.
+# curl -skLSJO https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+_zstd() {
+  [ -f "$BIN/zstd" ] && \
+  [ -f "$LIB/libzstd.a" ] && \
+  [ -f "$INCLUDE/zstd.h" ] && \
+  [ -f "$INCLUDE/zdict.h" ] && \
+  [ -f "$INCLUDE/zstd_errors.h" ] && \
+  return
+  app="zstd"
+  ver="1.5.7"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://github.com/facebook/$app/releases/download/v$ver/$pkg.$ext"
+  des="Zstandard - Fast real-time compression algorithm"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  # Compile all library sources including assembly for HUF decompression.
+  gcc -Os -static -ffunction-sections -fdata-sections -fno-pie -no-pie -w \
+    -I lib -I lib/common -I lib/compress -I lib/decompress -I lib/dictBuilder \
+    -c lib/common/*.c lib/compress/*.c lib/decompress/*.c lib/dictBuilder/*.c \
+    lib/decompress/*.S > /dev/null || die "Unable to build '$app' lib."
+  ar rcs "$LIB/libzstd.a" *.o > /dev/null || die "Unable to build '$app' static lib."
+  # Compile zstd CLI binary
+  gcc -Os -static -ffunction-sections -fdata-sections -fno-pie -no-pie -w -Wl,--gc-sections \
+    -I lib -I lib/common \
+    programs/zstdcli.c programs/zstdcli_trace.c programs/fileio.c \
+    programs/fileio_asyncio.c programs/benchfn.c programs/benchzstd.c \
+    programs/datagen.c programs/dibio.c programs/timefn.c \
+    programs/util.c programs/lorem.c \
+    -L "$LIB" -lzstd -o "$BIN/zstd" > /dev/null ||  die "Unable to build '$app' executable."
+  strip "$BIN/zstd" || die "Unable to strip '$app' executable."
+  # Note: Required for building `erofs-utils` (mkfs.erofs), NOT for ToyOS.
+  mv lib/zstd.h        "$INCLUDE" || die "Unable to move '$DL/$pkg/lib/zstd.h' header file to '$INCLUDE'"
+  mv lib/zdict.h       "$INCLUDE" || die "Unable to move '$DL/$pkg/lib/zdict.h' header file to '$INCLUDE'"
+  mv lib/zstd_errors.h "$INCLUDE" || die "Unable to move '$DL/$pkg/lib/zstd_errors.h' header file to '$INCLUDE'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `toybox`
+# Depends on `argp-standalone` `bash` `bison` `elfutils` `flex` `libelf` `libtool` `m4` `make` `musl-fts` `musl-obstack` `pkg-config` `zlib` `zstd`
+# curl -skLSJO https://landley.net/toybox/downloads/toybox-0.8.13.tar.gz
+# curl -skLSJO https://github.com/landley/toybox/archive/refs/tags/0.8.13.tar.gz
+# curl -skLSJO https://zlib.net/zlib-1.3.2.tar.gz
+# curl -skLSJO https://www.zlib.net/fossils/zlib-1.3.2.tar.gz
+# curl -skLSJO https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.79.tar.xz
+# curl -skLSJO https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.91.tar.xz
+_toybox() {
+  app="toybox"
+  ver="0.8.13"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+##url="https://landley.net/$app/downloads/$pkg.$ext"
+  url="https://github.com/landley/$app/archive/refs/tags/$ver.$ext"
+  des="All-in-one Linux command line"
+
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$DL/$pkg.$ext'"
+
+  # Linux Kernel package details.  
+  linux_src="linux-6.12.79"
+  linux_tar="$linux_src.tar.xz"
+
+  zlib_tar="zlib-1.3.2.tar.gz"
+  dropbear_tar="dropbear-2026.94.tar.bz2"
+  bash_tar="bash-5.3.tar.gz"
+
+  [ -f "$DL/$zlib_tar" ] || \
+  curl -skLSJ "https://zlib.net/$zlib_tar" -o "$DL/$zlib_tar" || \
+  die "Unable to download '$DL/$zlib_tar'"
+
+  [ -f "$DL/$dropbear_tar" ] || \
+  curl -skLSJ "https://matt.ucc.asn.au/dropbear/releases/$dropbear_tar" -o "$DL/$dropbear_tar" || \
+  die "Unable to download '$DL/$dropbear_tar'"
+
+  [ -f "$DL/$bash_tar" ] || \
+  curl -skLSJ "https://ftp.gnu.org/gnu/bash/$bash_tar" -o "$DL/$bash_tar"|| \
+  die "Unable to download '$DL/$dropbear_tar'"
+
+  # Remove the existing Toybox source.
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+
+  # Extract the Toybox source.
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+
+  toybox_src="$pkg"
+  # Create root_download directory in toybox source.
+  mkdir -p "$DL/$toybox_src/root_download" || die "Unable to create '$DL/$toybox_src/root_download' directory."
+
+  # Copy zlib, Dropbear and GNU BASH tarballs into "root_download".
+  # mkroot's package scripts fetch these during rootfs construction.
+  cp "$DL"/$zlib_tar     "$DL/$toybox_src/root_download/" || die "Unable to copy '$DL/$zlib_tar to '$DL/$toybox_src/root_download' directory."
+  cp "$DL"/$dropbear_tar "$DL/$toybox_src/root_download/" || die "Unable to copy '$DL/$dropbear_tar to '$DL/$toybox_src/root_download' directory."
+  cp "$DL"/$bash_tar     "$DL/$toybox_src/root_download/" || die "Unable to copy '$DL/$bash_tar to '$DL/$toybox_src/root_download' directory."
+
+  # Change mode of `gnubash` installation script to executable before copying.
+  chmod +x "$DL/gnubash" || die "Unable to change mode of '$DL/gnubash' installation script to executable."
+
+  # Copy GNU BASH installation script into "mkroot/packages" so mkroot
+  # picks it up as a buildable package during rootfs construction.
+  cp "$DL/gnubash" "$DL/$toybox_src/mkroot/packages/gnubash" || die "Unable to copy '$DL/$gnubash to '$DL/$toybox_src/mkroot/packages' directory."
+
+  # Switch to the Toybox source tree.
+  cd "$DL/$toybox_src/" || die "Unable to switch to '$DL/$toybox_src' source tree."
+
+# Patch mkroot/packages/dropbear
+# 1. Update zlib 1.3.1 ➞ 1.3.2
+# 2. Update dropbear 2024.86 ➞ 2026.91
+# 3. Add '--static' to the zlib ./configure — musl rootfs requires static binaries
+#
+# The checksum and filename must match the tarball in "root_download" exactly,
+# otherwise mkroot's integrity check will fail and abort the build.
+#
+# Verify SHA1Sum via:
+#   curl -Ls https://www.zlib.net/fossils/zlib-1.3.2.tar.gz | sha1sum
+#   curl -Ls https://matt.ucc.asn.au/dropbear/releases/dropbear-2026.94.tar.bz2 | sha1sum
+cat <<'EoP' | patch -p1 || die "Unable to patch to '$DL/$toybox_src/mkroot/packages/dropbear'"
+--- a/mkroot/packages/dropbear
++++ b/mkroot/packages/dropbear
+@@ -4,18 +4,18 @@
+ 
+ echo === download source
+ 
+-download f535367b1a11e2f9ac3bec723fb007fbc0d189e5 \
+-  https://www.zlib.net/fossils/zlib-1.3.1.tar.gz
++download 0097186c2635358f2239c95d559796238c6640d4 \
++  https://www.zlib.net/fossils/zlib-1.3.2.tar.gz
+ 
+-download 216ae176572dc008e128042eae82b6aacfdc8a51 \
+-  https://matt.ucc.asn.au/dropbear/releases/dropbear-2024.86.tar.bz2
++download b90898c109e33bf73d843d5602cddce371941c2d \
++  https://matt.ucc.asn.au/dropbear/releases/dropbear-2026.94.tar.bz2
+ 
+ echo === Native build static zlib
+ 
+ setupfor zlib
+ # They keep checking in broken generated files.
+ rm -f Makefile zconf.h &&
+-CC=${CROSS_COMPILE}cc LD=${CROSS_COMPILE}ld AS=${CROSS_COMPILE}as ./configure &&
++CC=${CROSS_COMPILE}cc LD=${CROSS_COMPILE}ld AS=${CROSS_COMPILE}as ./configure --static &&
+ make -j $(nproc) || exit 1
+ 
+ # do _not_ cleanup zlib, we need the files we just built for dropbear
+EoP
+
+
+# Patch scripts/install.sh
+# instlist is compiled directly here with $HOSTCC -static
+# musl rootfs requires static binaries.
+cat <<'EoP' | patch -p1 || die "Unable to patch to '$DL/$toybox_src/scripts/install.sh'"
+--- a/scripts/install.sh
++++ b/scripts/install.sh
+@@ -41,7 +41,7 @@
+ 
+ echo "Compile instlist..."
+ 
+-$DEBUG $HOSTCC -I . scripts/install.c -o "$UNSTRIPPED"/instlist || exit 1
++$DEBUG $HOSTCC -static -I . scripts/install.c -o "$UNSTRIPPED"/instlist || exit 1
+ COMMANDS="$("$UNSTRIPPED"/instlist $LONG_PATH)"
+ 
+ echo "${UNINSTALL:-Install} commands..."
+EoP
+
+
+# Patch scripts/portability.sh
+# brun() compiles scripts/*.c helpers directly with $HOSTCC — without -static,
+# these host helpers link dynamically and may not run correctly.
+cat <<'EoP' | patch -p1 || die "Unable to patch to '$DL/$toybox_src/scripts/portability.sh'"
+--- a/scripts/portability.sh
++++ b/scripts/portability.sh
+@@ -57,6 +57,6 @@
+ brun() {
+   [ ! -e "$UNSTRIPPED"/$1 -o "$UNSTRIPPED"/$1 -ot scripts/$1.c ] &&
+     { mkdir -p "$UNSTRIPPED" &&
+-      do_loudly $HOSTCC scripts/$1.c -o "$UNSTRIPPED"/$1 || exit 1; }
++      do_loudly $HOSTCC -static scripts/$1.c -o "$UNSTRIPPED"/$1 || exit 1; }
+   do_loudly "$UNSTRIPPED"/$1 "${@:2}"
+ }
+EoP
+
+
+# Patch scripts/make.sh
+# 1. hostcomp() : add '-static' (used for mkflags, kconfig host tools)
+# 2. instlist   : add '-static' (compiled inline, not via hostcomp())
+cat <<'EoP' | patch -p1 || die "Unable to patch to '$DL/$toybox_src/scripts/make.sh'"
+--- a/scripts/make.sh
++++ b/scripts/make.sh
+@@ -53,7 +53,7 @@
+ {
+   if [ ! -f "$UNSTRIPPED"/$1 ] || [ "$UNSTRIPPED"/$1 -ot scripts/$1.c ]
+   then
+-    do_loudly $HOSTCC scripts/$1.c -o "$UNSTRIPPED"/$1 || exit 1
++    do_loudly $HOSTCC -static scripts/$1.c -o "$UNSTRIPPED"/$1 || exit 1
+   fi
+ }
+ 
+@@ -231,7 +231,7 @@
+ 
+ if grep -qx 'CONFIG_TOYBOX_ZHELP=y' "$KCONFIG_CONFIG"
+ then
+-  do_loudly $HOSTCC -I . scripts/install.c -o "$UNSTRIPPED"/instlist || exit 1
++  do_loudly $HOSTCC -static -I . scripts/install.c -o "$UNSTRIPPED"/instlist || exit 1
+   { echo "#define ZHELP_LEN $("$UNSTRIPPED"/instlist --help | wc -c)" &&
+     "$UNSTRIPPED"/instlist --help | gzip -9 | od -Anone -vtx1 | \
+     sed 's/ /,0x/g;1s/^,/static char zhelp_data[] = {\n /;$s/.*/&};/'
+EoP
+
+
+# Patch mkroot/mkroot.sh
+# 1. Skip `make distclean` on kernel tree — preserves custom toolchain / lite_os.config)
+# 2. Inject HOSTCC/HOSTCFLAGS/HOSTLDFLAGS into allnoconfig (kconfig host tools need libelf and zlib)
+# 3. Inject full host toolchain + ZSTD path into the kernel build line
+cat <<'EoP' | patch -p1 || die "Unable to patch to '$DL/$toybox_src/mkroot/mkroot.sh'"
+--- a/mkroot/mkroot.sh
++++ b/mkroot/mkroot.sh
+@@ -342,3 +342,3 @@
+   announce "linux-$KARCH"
+-  pushd "$LINUX" && make distclean && popd &&
++  pushd "$LINUX" && popd &&
+   cp -sfR "$LINUX" "$TEMP/linux" && pushd "$TEMP/linux" &&
+@@ -366,5 +366,5 @@
+   # Expand miniconfig to full .config
+-  make ARCH=$KARCH allnoconfig KCONFIG_ALLCONFIG="$OUTDOC/linux-miniconfig" &&
++  make ARCH=$KARCH allnoconfig KCONFIG_ALLCONFIG="$OUTDOC/linux-miniconfig" HOSTCC="gcc -static" HOSTCFLAGS="-I/var/tmp/sysroot/include" HOSTLDFLAGS="-L/var/tmp/sysroot/lib -static -lelf -lz" &&
+   cp .config "$OUTDOC/linux-fullconfig" &&
+ 
+   # Build kernel. Copy config, device tree binary, and kernel binary to output
+@@ -370,3 +370,3 @@
+   # Build kernel. Copy config, device tree binary, and kernel binary to output
+-  make ARCH=$KARCH CROSS_COMPILE="$CROSS_COMPILE" -j $(nproc) all || exit 1
++  make ARCH=$KARCH CROSS_COMPILE="$CROSS_COMPILE" HOSTCC="gcc -static" HOSTAR=ar HOSTLD=ld HOSTCFLAGS="-I/var/tmp/sysroot/include" HOSTLDFLAGS="-L/var/tmp/sysroot/lib -static -lelf -lz" CC=gcc AR=ar NM=nm STRIP=strip LD=ld READELF=readelf OBJCOPY=objcopy LLVM=0 LLVM_IAS=0 SKIP_STACK_VALIDATION=1 ZSTD="/var/tmp/sysroot/bin/zstd" -j$(nproc) all || exit 1
+   [ -n "$DTB" ] && { cp "$(find -name $DTB)" "$OUTPUT/linux.dtb" || exit 1 ;}
+EoP
+
+
+  # Pre-build kconfig and mkflags as static binaries before `make defconfig`.
+  # `make` looks for them before hostcomp() gets a chance to compile them.
+  mkdir -p generated/unstripped || die "Unable to create '$DL/$toybox_src/generated/unstripped' directory."
+  gcc -static scripts/kconfig.c -o generated/unstripped/kconfig || die "Unable to build '$DL/$toybox_src/generated/unstripped/kconfig'"
+  gcc -static scripts/mkflags.c -o generated/unstripped/mkflags || die "Unable to build '$DL/$toybox_src/generated/unstripped/mkflags'"
+
+  # `mkroot.sh` uses process substitution (<()) which requires /dev/fd -> /proc/self/fd
+  [ -e /dev/fd ] || ln -sfn /proc/self/fd /dev/fd || die "Unable to create /dev/fd symlink"
+
+  # Create the minimal Toybox configuration.
+  # Write lite_os.config — Linux Kernel config seed for `make defconfig`
+  cat > "$DL/$toybox_src/lite_os.config" << 'EoC' || die "Unable to create '$DL/$toybox_src/lite_os.config'"
+CONFIG_GZIP=y
+CONFIG_IFCONFIG=y
+CONFIG_IP=y
+CONFIG_PING=y
+CONFIG_ROUTE=y
+EoC
+
+  # Generate the complete Toybox configuration.
+  KCONFIG_ALLCONFIG="$DL/$toybox_src/lite_os.config" make defconfig || die "Unable to generate the complete Toybox configuration."
+  # Build toybox with static linking, then invoke `mkroot.sh` to build the
+  # Linux Kernel and assemble with the rootfs in one shot.
+  make -j$(nproc) HOSTCC='gcc -static' LDFLAGS='-static' > /dev/null || die "Unable to build Toybox with static linking"
+
+  # Download and extract Linux Kernel source.
+  [ -f "$DL/$linux_tar" ] || \
+  curl -skLSJ "https://cdn.kernel.org/pub/linux/kernel/v6.x/$linux_tar" -o "$DL/$linux_tar" || \
+  die "Unable to download '$linux_tar'"
+  rm -rf "$DL/$linux_src" || die "Unable to remove existing '$DL/$linux_src' source tree."
+  tar -xf "$DL/$linux_tar" -C "$DL" || die "Unable to extract the '$DL/$linux_tar' into '$DL'"
+  
+  # Remove old LiteOS build.
+  rm -rf "$DL/LiteOS/" || die "Unable to remove old 'LiteOS' build."
+
+  # Build Toybox Root File System and Linux Kernel via `mkroot.sh`
+  ./mkroot/mkroot.sh \
+    HOSTCC="$BIN/gcc" \
+    HOSTCFLAGS="-I$INCLUDE" \
+    HOSTLDFLAGS="-L$LIB" \
+    LDFLAGS='-static' \
+    TARGET='x86_64' \
+    CROSS='x86_64' \
+    CROSS_COMPILE="$BIN/x86_64-linux-musl-" \
+    LINUX="$DL/$linux_src" \
+    PENDING='dhcp awk bc xzcat expr tr vi gzip diff' \
+    KEXTRA='BLK_DEV_NVME,CRYPTO,CRYPTO_AES,CRYPTO_HASH,CRYPTO_HMAC,CRYPTO_SHA1,CRYPTO_SHA256,DEVPTS_FS,ENA_ETHERNET,EPOLL,EROFS_FS,EROFS_FS_ZIP,EROFS_FS_ZIP_DEFLATE,EROFS_FS_ZIP_ZSTD,FUTEX,HYPERVISOR_GUEST,INOTIFY_USER,IP_PNP,IP_PNP_DHCP,KERNEL_ZSTD,KVM_GUEST,NAMESPACES,NET_VENDOR_AMAZON,NVME_CORE,PARAVIRT,PCI_MSI,POSIX_MQUEUE,SHMEM,SYSVIPC,UNIX98_PTYS,VIRTIO,VIRTIO_BLK,VIRTIO_MMIO,VIRTIO_MMIO_CMDLINE_DEVICES,VIRTIO_NET,VIRTIO_PCI' \
+    OUTPUT="$DL/LiteOS/" \
+    dropbear \
+    gnubash >/dev/null || die "Unable to build LiteOS."
+
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+  rm -rf "$DL/$linux_src" || die "Unable to remove '$DL/$linux_src'"
+}
+
+# Build LiteOS - Minimal Linux-based Operating System.
+# LiteOS: `toybox` + `dropbear` with `zlib` + `bash` + `kernel`
+_lite_os() {
+  _cp_tools
+  _make
+  _m4
+  _bison
+  _flex
+  _argp_standalone
+  _musl_fts
+  _musl_obstack
+  _pkg_config
+  _zlib
+  _elfutils
+  _zstd
+  _toybox
+}
+
+# LiteOS AMI (Amazon Machine Image) build automation performs the following steps:
+# • Creates a new AWS VPC for the LiteOS AMI Builder.
+# • Creates an AWS Public Subnet for the LiteOS AMI Builder in one of the AWS Region's Availability Zones.
+# • Creates an AWS Internet Gateway for the LiteOS AMI Builder AWS VPC and wires up public internet access.
+# • Creates the AWS Security Group for the LiteOS AMI Builder in the AWS VPC.
+# • Allows SSH access from the client's public IP address to the LiteOS AMI Builder AWS Security Group.
+# • Creates an AWS EBS Volume to use as a virtual USB flash drive for flashing LiteOS.
+# • Imports the SSH public key for the LiteOS AMI Builder AWS EC2 Instance into AWS Key Pairs.
+# • Launches the LiteOS AMI Builder AWS EC2 Instance to build the LiteOS AWS AMI.
+# • Deletes the SSH public key for the LiteOS AMI Builder AWS EC2 Instance.
+# • Attaches the LiteOS flash drive AWS EBS Volume to the LiteOS AMI Builder AWS EC2 Instance.
+# • Retrieve the public IP address of the LiteOS AMI Builder AWS EC2 Instance for SSH access.
+# • Create the '/var/tmp/sysroot/dl' directory structure on the LiteOS AMI Builder AWS EC2 Instance.
+# • Securely transfer the files LiteOS archive and flashing script to the LiteOS AMI Builder AWS EC2 Instance.
+# • Remotely execute the LiteOS flashing script to flash LiteOS onto the attached AWS EBS virtual flash drive.
+# • Detaches an AWS EBS virtual flash drive from the LiteOS AMI Builder AWS EC2 Instance.
+# • Terminates the LiteOS AMI Builder AWS EC2 Instance after completing the LiteOS flashing into AWS EBS Volume.
+# • Creates an AWS Snapshot of the LiteOS AWS EBS Volume flash drive.
+# • Deletes the LiteOS AWS EBS Volume flash drive after creating the LiteOS AWS Snapshot.
+# • Registers the LiteOS AWS AMI from the LiteOS AWS EBS Snapshot.
+# • Deletes the LiteOS AMI Builder AWS Public Subnet.
+# • Deletes the LiteOS AMI Builder AWS Route Table.
+# • Detaches the LiteOS AMI Builder AWS Internet Gateway from the LiteOS AMI Builder AWS VPC and deletes it.
+# • Deletes the LiteOS AMI Builder AWS Security Group.
+# • Deletes the LiteOS AMI Builder AWS VPC.
+_lite_os_ami() {
+  user='ubuntu'
+  lite_os_ami_name='LiteOS-0.8.13'
+  region='ap-south-1'
+  availability_zone='ap-south-1b'
+  key_name='lite_os'
+  public_key_material="fileb://$DL/lite_os.pem.pub"
+  security_group_id='sg-012aa7d0d744e7a41'
+  subnet_id='subnet-09884475c56e146c7'
+  image_id='ami-02b8269d5e85954ef'
+  instance_type='t3.micro'
+  root_device_name='/dev/xvda'
+
+  # Imports the public key from an RSA or ED25519 key pair that you created using a third-party tool.
+  # You give Amazon Web Services only the public key.
+  aws ec2 import-key-pair \
+    --tag-specifications 'ResourceType=key-pair,Tags=[{Key=Name,Value=LiteOS_Pub_Key}]' \
+    --key-name "$key_name" \
+    --public-key-material "$public_key_material" \
+    --output 'off' \
+    --region "$region" >/dev/null 2>&1 || true
+
+  # Describes the specified security groups or all of your security groups.
+  # Retrieve the number of inbound (ingress) rules configured for the specified security group.
+  sg_rule_count=$(aws ec2 describe-security-groups \
+    --group-ids "$security_group_id" \
+    --query 'length(SecurityGroups[0].IpPermissions)' \
+    --output 'text' \
+    --region "$region") >/dev/null || die "Unable to retrieve the inbound rule count for SG ID: '$security_group_id'"
+
+  # Removes the specified inbound (ingress) rules from a security group.
+  test "$sg_rule_count" -eq 0 || \
+  aws ec2 revoke-security-group-ingress \
+    --cli-input-json "$(aws ec2 describe-security-groups \
+      --group-ids "$security_group_id" \
+      --query '{GroupId:SecurityGroups[0].GroupId,IpPermissions:SecurityGroups[0].IpPermissions}' \
+      --output json \
+      --region "$region")" \
+    --output off \
+    --region "$region" || die "Unable to remove the inbound rules from SG ID: '$security_group_id'"
+
+  # Retrieve the current host's public IPv4 address.
+  public_ip=$(curl -fksS https://checkip.amazonaws.com) || die "Unable to retrieve the current host public IPv4 address."
+
+  # Adds the specified inbound (ingress) rules to a security group.
+  # Allow SSH access from the client's public IP address to the security group.
+  aws ec2 authorize-security-group-ingress \
+    --group-id "$security_group_id" \
+    --ip-permissions IpProtocol='tcp',FromPort=22,ToPort=22,IpRanges="[{CidrIp='${public_ip}/32',Description='SSH Connection from Host IP'}]" \
+    --output 'off' \
+    --region "$region" || die "Unable to add the client SSH inbound rule to SG ID: '$security_group_id'"
+
+  # Creates an EBS volume that can be attached to an instance in the same Availability Zone.
+  # Creates an EBS volume to use as a virtual USB drive for flashing LiteOS.
+  volume_id=$(aws ec2 create-volume \
+    --availability-zone "$availability_zone" \
+    --no-encrypted \
+    --iops 3000 \
+    --size "8" \
+    --volume-type 'gp3' \
+    --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=LiteOS_Flash_Drive}]" \
+    --no-multi-attach-enabled \
+    --throughput "125" \
+    --query 'VolumeId' \
+    --output text \
+    --region "$region") || die "Unable to create the LiteOS flash drive EBS volume in AZ '$availability_zone'"
+
+  # Wait until JMESPath query Volumes[].State returns available for all elements when polling with describe-volumes.
+  # It will poll every 15 seconds until a successful state has been reached.
+  # Wait until the LiteOS flash drive EBS volume reaches the 'available' state.
+  aws ec2 wait volume-available \
+    --volume-ids "$volume_id" \
+    --output off \
+    --region "$region" || die "LiteOS flash drive EBS volume '$volume_id' did not reach the 'available' state."
+
+  # Launches the specified number of instances using an AMI for which you have permissions.
+  # Launches the LiteOS Builder instance to build the LiteOS AMI.
+  # Note: The selected AMI determines the OS, virtualization (HVM), volume type (SSD), and architecture (x86_64).
+  instance_id=$(aws ec2 run-instances \
+    --image-id "$image_id" \
+    --instance-type "$instance_type" \
+    --key-name "$key_name" \
+    --security-group-ids "$security_group_id" \
+    --subnet-id "$subnet_id" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=LiteOS_Builder}]" \
+    --associate-public-ip-address \
+    --count 1 \
+    --query 'Instances[0].InstanceId' \
+    --output text \
+    --region "$region") || die "Unable to launch the LiteOS Builder instance (AMI: '$image_id', instance type: '$instance_type', subnet: '$subnet_id', security group: '$security_group_id', Region: '$region')"
+
+  # Wait until JMESPath query Reservations[].Instances[].State.Name returns running for all elements when polling with describe-instances.
+  # It will poll every 15 seconds until a successful state has been reached.
+  # Wait until LiteOS Builder instance reach the 'running' state.
+  aws ec2 wait instance-running \
+    --instance-ids "$instance_id" \
+    --output off \
+    --region "$region" || die "LiteOS Builder instance '$instance_id' did not reach the 'running' state."
+
+  # Attaches an Amazon EBS volume to a running or stopped instance.
+  # Attaches an Amazon EBS volume to the LiteOS Builder instance for flashing LiteOS.
+  aws ec2 attach-volume \
+    --device '/dev/sdf' \
+    --instance-id "$instance_id" \
+    --volume-id "$volume_id" \
+    --output 'off' \
+    --region "$region" || die "Unable to attach the LiteOS flash drive EBS volume '$volume_id' to the LiteOS Builder instance '$instance_id'"
+
+  # Wait until JMESPath query Volumes[].State returns in-use for all elements when polling with describe-volumes.
+  # It will poll every 15 seconds until a successful state has been reached.
+  # Wait until LiteOS flash drive EBS volume reach 'in-use' state.
+  aws ec2 wait volume-in-use \
+    --volume-ids "$volume_id" \
+    --region "$region" || die "LiteOS flash drive EBS volume '$volume_id' did not reach the 'in-use' state"
+
+  # Describes the specified instances or all instances.
+  # Retrieve the public IP address of the LiteOS Builder instance for SSH access.
+  hostname=$(aws ec2 describe-instances \
+    --instance-ids "$instance_id" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' \
+    --output text \
+    --region "$region") || die "Unable to retrieve the public IP address of the LiteOS Builder instance '$instance_id' in region '$region'"
+
+  # Wait until JMESPath query Reservations[].Instances[].State.Name returns running for all elements when polling with describe-instances.
+  # It will poll every 15 seconds until a successful state has been reached.
+  # Wait until LiteOS Builder instance reach the 'OK' state.
+  aws ec2 wait instance-status-ok \
+    --instance-ids "$instance_id" \
+    --output off \
+    --region "$region" || die "LiteOS Builder instance '$instance_id' did not reach the 'OK' state."
+
+  # Create the '/var/tmp/sysroot/dl' directory structure on the LiteOS Builder instance.
+  ssh \
+    -o LogLevel=ERROR \
+    -o ServerAliveInterval=60 \
+    -o ServerAliveCountMax=30 \
+    -o CheckHostIP=no \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -i "$DL/lite_os.pem" "$user@$hostname" -p 22 \
+    "mkdir -p $DL" || die "Unable to create '$DL' on LiteOS Builder instance '$user@$hostname'"
+
+  # Securely copy the LiteOS archive and flashing script to the LiteOS Builder instance.
+  scp -q \
+    -o LogLevel=ERROR \
+    -o CheckHostIP=no \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -i "$DL/lite_os.pem" -P 22 \
+    "$DL/LiteOS.tar.gz" \
+    "$DL/flash_lite_os.sh" \
+    "$user@$hostname:$DL" || die "Unable to transfer the LiteOS archive and flashing script to LiteOS Builder instance '$user@$hostname'"
+
+  # Remotely execute the LiteOS flashing script to flash LiteOS onto the attached AWS EBS virtual flash drive.
+  ssh \
+    -o LogLevel=ERROR \
+    -o ServerAliveInterval=60 \
+    -o ServerAliveCountMax=30 \
+    -o CheckHostIP=no \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -i "$DL/lite_os.pem" "$user@$hostname" -p 22 \
+    "chmod +x $DL/flash_lite_os.sh && sudo $DL/flash_lite_os.sh" || die "Unable to execute the LiteOS flashing script on LiteOS Builder instance '$user@$hostname'"
+
+  # Detaches an EBS volume from an instance.
+  # Detaches an EBS virtual flash drive from the LiteOS Builder instance.
+  aws ec2 detach-volume \
+    --device '/dev/sdf' \
+    --no-force \
+    --instance-id "$instance_id" \
+    --volume-id "$volume_id" \
+    --output 'off' \
+    --region "$region" || die "Unable to detach LiteOS EBS volume '$volume_id' from Builder instance '$instance_id' in region '$region'"
+
+  # Wait until JMESPath query Volumes[].State returns available for all elements when polling with describe-volumes.
+  # It will poll every 15 seconds until a successful state has been reached.
+  # Wait until the LiteOS EBS volume is 'detached' and reaches the 'available' state.
+  aws ec2 wait volume-available \
+    --volume-ids "$volume_id" \
+    --output 'off' \
+    --region "$region" || die "LiteOS flash drive EBS volume '$volume_id' did not reach the 'available' state"
+
+  # Terminates the specified instances.
+  # Terminates the LiteOS Builder instance after completing the LiteOS flashing process.
+  aws ec2 terminate-instances \
+    --instance-ids "$instance_id" \
+    --no-force \
+    --output 'off' \
+    --region "$region" || die "Unable to terminate LiteOS Builder instance '$instance_id' in region '$region'"
+
+  # Wait until JMESPath query Reservations[].Instances[].State.Name returns terminated for all elements when polling with describe-instances.
+  # It will poll every 15 seconds until a successful state has been reached.
+  # Wait until the LiteOS AMI Builder instance is terminated.
+  aws ec2 wait instance-terminated \
+    --instance-ids "$instance_id" \
+    --output 'off' \
+    --region "$region" || die "LiteOS Builder instance '$instance_id' did not reach the 'terminated' state"
+
+  # Creates a snapshot of an EBS volume and stores it in Amazon S3.
+  # Creates a snapshot of the LiteOS EBS flash drive volume.
+  snapshot_id=$(aws ec2 create-snapshot \
+    --description 'LiteOS Snapshot' \
+    --volume-id "$volume_id" \
+    --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=$lite_os_ami_name}]" \
+    --query 'SnapshotId' \
+    --output text \
+    --region "$region") || die "Unable to create a snapshot of LiteOS EBS volume '$volume_id' in region '$region'"
+
+  # Wait until JMESPath query Snapshots[].State returns completed for all elements when polling with describe-snapshots.
+  # It will poll every 15 seconds until a successful state has been reached.
+  # Wait until the LiteOS EBS snapshot reaches the 'completed' state.
+  aws ec2 wait snapshot-completed \
+    --snapshot-ids "$snapshot_id" \
+    --region "$region" || die "LiteOS EBS snapshot '$snapshot_id' did not reach the 'completed' state"
+
+  # Deletes the specified EBS volume.
+  # The volume must be in the available state (not attached to an instance).
+  # Deletes the LiteOS flash drive EBS volume after creating the LiteOS snapshot.
+  aws ec2 delete-volume \
+    --volume-id "$volume_id" \
+    --output 'off' \
+    --region "$region" || die "Unable to delete LiteOS flash drive EBS volume '$volume_id' in region '$region'"
+
+  # Describes the specified images (AMIs, AKIs, and ARIs) available to you or all of the images available to you.
+  # Retrieves the AMI ID for the LiteOS image.
+  lite_os_image_id=$(aws ec2 describe-images \
+    --owners 'self' \
+    --filters "Name=name,Values=$lite_os_ami_name" \
+    --query 'Images[0].ImageId' \
+    --output 'text') || die "Unable to retrieve the AMI ID for the LiteOS AMI named '$lite_os_ami_name'"
+
+  # Deregisters the specified AMI.
+  # Deregisters the existing LiteOS AMI.
+  test "$lite_os_image_id" = "None" || \
+  aws ec2 deregister-image \
+    --image-id "$lite_os_image_id" \
+    --delete-associated-snapshots \
+    --output off \
+    --region "$region" || die "Unable to deregister the LiteOS AMI ID: '$lite_os_image_id'"
+
+  # Registers an AMI.
+  # Registers the LiteOS AMI from the LiteOS EBS snapshot.
+  ami_id=$(aws ec2 register-image \
+    --boot-mode 'uefi' \
+    --tag-specifications "ResourceType=image,Tags=[{Key=Name,Value=$lite_os_ami_name}]" \
+    --name "$lite_os_ami_name" \
+    --description "$lite_os_ami_name" \
+    --architecture 'x86_64' \
+    --root-device-name "$root_device_name" \
+    --block-device-mappings "DeviceName=${root_device_name},Ebs={DeleteOnTermination=true,Iops=3000,SnapshotId=${snapshot_id},VolumeSize=8,VolumeType=gp3,Throughput=125}" \
+    --virtualization-type 'hvm' \
+    --ena-support \
+    --query 'ImageId' \
+    --output text \
+    --region "$region") || die "Unable to register the LiteOS AMI from snapshot '$snapshot_id' in region '$region'"
+
+  # Wait until JMESPath query Images[].State returns available for all elements when polling with describe-images.
+  # It will poll every 15 seconds until a successful state has been reached.
+  # Wait until the LiteOS AMI reaches the 'available' state.
+  aws ec2 wait image-available \
+    --image-ids "$ami_id" \
+    --output 'off' \
+    --region "$region" || die "LiteOS AMI '$ami_id' did not reach the 'available' state in region '$region'"
+}
+
+# Build `perl`
+# Depends on `libz`
+# Required by `autoconf` `automake`
+# curl -skLSJO https://www.cpan.org/src/5.0/perl-5.42.2.tar.xz
+_perl() {
+  [ -f "$BIN/perl" ] && [ -d "$LIB/perl5" ] && return
+  app="perl"
+  ver="5.42.2"
+  pkg="${app}-${ver}"
+  ext="tar.xz"
+  url="https://www.cpan.org/src/5.0/$pkg.$ext"
+  des="Larry Wall Practical Extraction and Report Language"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  sh Configure \
+    -d \
+    -e \
+    -s \
+    -Duse64bitint \
+    -Dinc_version_list=none \
+    -DEBUGGING=none \
+    -Dcc=gcc \
+    -Dprefix="$SYSROOT" \
+    -Dcpp=gcc \
+    -Dcpprun='gcc -E' \
+    -Dcppstdin='gcc -E' \
+    -Dccflags="-fwrapv -I$INCLUDE -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64 -D_FORTIFY_SOURCE=2" \
+    -Dcppflags="-fwrapv -I$INCLUDE" \
+    -Doptimize='-O2' \
+    -Dldflags="-static -L$LIB" \
+    -Dlibs='-lm -lc' \
+    -Dman1dir=none \
+    -Dman3dir=none \
+    -Dinstallman1dir=none \
+    -Dinstallman3dir=none \
+    -Dhtml1dir=none \
+    -Dhtml3dir=none \
+    -Ud_shared \
+    -Uusedl \
+    -Uusethreads \
+    -Uuseithreads \
+    -Uuse64bitall \
+    -Uusemultiplicity \
+    -Uuseshrplib >/dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" >/dev/null || die "Unable to build '$app'"
+  strip perl || die "Unable to strip '$app' executable."
+  mv perl "$BIN/perl" || die "Unable to move '$app' executable to '$BIN'"
+  rm -rf "$LIB/perl5" || die "Unable to remove existing '$LIB/perl5' directory."
+  mkdir -p "$LIB/perl5" || die "Unable to create '$LIB/perl5' directory."
+  cp -r "$DL/perl-5.42.2/lib" "$LIB/perl5/5.42.2" || die "Unable to copy '$DL/perl-5.42.2/lib' to '$LIB/perl5/5.42.2'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `autoconf`
+# Depends on `m4` `perl`
+# This build yields `autoconf` `autoheader` `autom4te` `autoreconf` `autoscan` `autoupdate` `ifnames`
+# curl -skLSJO https://ftp.gnu.org/gnu/autoconf/autoconf-2.73.tar.xz
+_autoconf() {
+  [ -f "$BIN/autoconf" ] && \
+  [ -f "$BIN/autoheader" ] && \
+  [ -f "$BIN/autoreconf" ] && \
+  [ -f "$BIN/autom4te" ] && \
+  return
+  app="autoconf"
+  ver="2.73"
+  pkg="${app}-${ver}"
+  ext="tar.xz"
+  url="https://ftp.gnu.org/gnu/$app/$pkg.$ext"
+  des="GNU tool for automatically configuring source code"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --infodir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --disable-option-checking \
+    --enable-silent-rules \
+    CC=gcc > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" > /dev/null || die "Unable to build '$app'"
+  make install > /dev/null || die "Unable to install '$app'"
+  rm "$BIN/autoscan" || die "Unable to remove '$BIN/autoscan'"
+  rm "$BIN/autoupdate" || die "Unable to remove '$BIN/autoupdate'"
+  rm "$BIN/ifnames" || die "Unable to remove '$BIN/ifnames'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `automake`
+# Depends on `perl`
+# This build yields `aclocal` `automake`
+# curl -skLSJO https://ftp.gnu.org/gnu/automake/automake-1.18.1.tar.xz
+_automake() {
+  [ -f "$BIN/aclocal" ] && [ -f "$BIN/automake" ] && return
+  app="automake"
+  ver="1.18.1"
+  pkg="${app}-${ver}"
+  ext="tar.xz"
+  url="https://ftp.gnu.org/gnu/$app/$pkg.$ext"
+  des="GNU tool for automatically creating Makefiles"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --infodir="$DL/$pkg" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --disable-option-checking \
+    --enable-silent-rules \
+    CC=gcc \
+    LDFLAGS='-static' \
+    LIBS='-lm -lc' \
+    GNU_CC=gcc \
+    GNU_CFLAGS='-O2' > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" > /dev/null || die "Unable to build '$app'"
+  make install > /dev/null || die "Unable to install '$app'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `libtool`
+# Depends on `autoconf` `automake` `diffutils` `m4`
+# Required by `util-linux`
+# This build yields `libtoolize` `libtool`
+# curl -skLSJO https://ftp.gnu.org/gnu/libtool/libtool-2.5.4.tar.xz
+_libtool() {
+  [ -f "$BIN/libtool" ] && \
+  [ -f "$BIN/libtoolize" ] && \
+  [ -f "$LIB/libltdl.a" ] && \
+  [ -f "$INCLUDE/ltdl.h" ] && \
+  [ -f "$INCLUDE/libltdl/lt_error.h" ] && \
+  [ -f "$INCLUDE/libltdl/lt_dlloader.h" ] && \
+  [ -f "$INCLUDE/libltdl/lt_system.h" ] && \
+  return
+  app="libtool"
+  ver="2.5.4"
+  pkg="${app}-${ver}"
+  ext="tar.xz"
+  url="https://ftp.gnu.org/gnu/$app/$pkg.$ext"
+  des="Generic library support script"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --infodir="$DL/$pkg" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --disable-option-checking \
+    --enable-silent-rules \
+    --disable-dependency-tracking \
+    --disable-shared \
+    --enable-static \
+    --disable-fast-install \
+    --disable-libtool-lock \
+    --enable-ltdl-install \
+    --enable-cross-guesses='risky' \
+    --with-gnu-ld \
+    --with-sysroot="$SYSROOT" \
+    M4="$BIN/m4" \
+    CC=gcc \
+    CFLAGS="-Os -ffunction-sections -fdata-sections -w" \
+    LDFLAGS="-static -Wl,--gc-sections" \
+    LIBS='-lm -lc' \
+    F77='' \
+    FC='' > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" > /dev/null || die "Unable to build '$app'"
+  make install > /dev/null || die "Unable to install '$app'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `util-linux` Sub Package `libuuid` static library archive.
+# Required by `mkfs.erofs`
+# Note: 'libuuid.a' generates Filesystem UUID which is required by `mkfs.erofs`, but it's optional.
+# curl -skLSJO https://cdn.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.2.tar.xz
+_util_linux() {
+  [ -f "$LIB/libuuid.a" ] && [ -f "$INCLUDE/uuid.h" ] && return
+  app="util-linux"
+  ver="2.42"
+  rel="2"
+  pkg="${app}-${ver}.${rel}"
+  ext="tar.xz"
+  url="https://cdn.kernel.org/pub/linux/utils/$app/v$ver/$pkg.$ext"
+  des="Random collection of Linux utilities"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --libdir="$LIB" \
+    --includedir="$INCLUDE" \
+    --infodir="$DL/$pkg" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --disable-option-checking \
+    --disable-dependency-tracking \
+    --enable-silent-rules \
+    --disable-symvers \
+    --disable-largefile \
+    --disable-assert \
+    --disable-nls \
+    --disable-rpath \
+    --disable-all-programs \
+    --disable-asciidoc \
+    --disable-poman \
+    --disable-tls \
+    --disable-widechar \
+    --enable-year2038 \
+    --enable-static \
+    --disable-shared \
+    --disable-fast-install \
+    --disable-libtool-lock \
+    --enable-libuuid \
+    --disable-liblastlog2 \
+    --disable-libblkid \
+    --disable-libmount \
+    --disable-libsmartcols \
+    --disable-libfdisk \
+    --disable-uuidd \
+    --disable-uuidgen \
+    --disable-bash-completion \
+    --disable-pylibmount \
+    --disable-makeinstall-chown \
+    --disable-makeinstall-setuid \
+    --disable-makeinstall-tty-setgid \
+    --disable-colors-default \
+    --with-gnu-ld \
+    --with-sysroot="$SYSROOT" \
+    --without-libiconv-prefix \
+    --without-libintl-prefix \
+    --without-util \
+    --without-udev \
+    --without-ncursesw \
+    --without-tinfo \
+    --without-readline \
+    --without-cap-ng \
+    --without-libz \
+    --without-libmagic \
+    --without-user \
+    --without-btrfs \
+    --without-systemd \
+    --without-econf \
+    --without-python \
+    --without-cryptsetup \
+    CC=gcc \
+    CFLAGS='-Os -ffunction-sections -fdata-sections -w' \
+    LDFLAGS='-static -Wl,--gc-sections' \
+    LIBS='-lm -lc' \
+    YACC="$BIN/bison -y" \
+    PKG_CONFIG="$BIN/pkg-config" \
+    PKG_CONFIG_PATH="$LIB/pkgconfig" \
+    PKG_CONFIG_LIBDIR="$LIB/pkgconfig" \
+    PKG_CONFIG_SYSROOT_DIR="$SYSROOT" > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" libuuid.la > /dev/null || die "Unable to build '$app'"
+  mv libuuid.la "$LIB" || die "Unable to move '$DL/$pkg/libuuid.la' to '$LIB'"
+  mv .libs/libuuid.a "$LIB" || die "Unable to move '$DL/$pkg/.libs/libuuid.a' to '$LIB'"
+  mv libuuid/src/uuid.h "$INCLUDE" || die "Unable to move '$DL/$pkg/libuuid/src/uuid.h' to '$INCLUDE'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `erofs-utils` command `mkfs.erofs` — Enhanced Read-Only File System
+# Depends on `autoconf` `automake` `libtool` `m4` `make` `perl` `pkg-config` `util-linux` `zlib` `zstd`
+# curl -skLSJO https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-1.9.1.tar.gz
+_erofs_utils() {
+  [ -f "$BIN/mkfs.erofs" ] && return
+  app="erofs-utils"
+  ver="1.9.1"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://git.kernel.org/pub/scm/linux/kernel/git/xiang/$app.git/snapshot/$pkg.$ext"
+  des="userspace utilities for erofs filesystem"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+
+  mkdir -p m4 || die "Unable to create '$DL/$pkg/m4' directory."
+  mkdir -p "$LIB/pkgconfig" || die "Unable to create '$LIB/pkgconfig' directory."
+
+  # `zstd` package configuration for pkg-config
+  cat > "$LIB/pkgconfig/libzstd.pc" << EoZstdPC || die "Unable to create $LIB/pkgconfig/libzstd.pc"
+prefix=/var/tmp/sysroot
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+Name: zstd
+Description: Zstandard fast lossless compression algorithm
+Version: 1.5.7
+Libs: -L\${libdir} -lzstd
+Cflags: -I\${includedir}
+EoZstdPC
+
+  # `libuuid` package configuration for pkg-config
+  cat > "$LIB/pkgconfig/uuid.pc" << EoUUIDPC || die "Unable to create $LIB/pkgconfig/uuid.pc"
+prefix=/var/tmp/sysroot
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+Name: uuid
+Description: Universally Unique ID library
+Version: 2.42.1
+Libs: -L\${libdir} -luuid
+Cflags: -I\${includedir}
+EoUUIDPC
+
+  sh autogen.sh > /dev/null || die "Unable to run 'autogen.sh' script."
+
+  ./configure \
+    --prefix="$SYSROOT" \
+    --libdir="$LIB" \
+    --includedir="$INCLUDE" \
+    --infodir="$DL/$pkg" \
+    --localedir="$DL/$pkg" \
+    --mandir="$DL/$pkg" \
+    --docdir="$DL/$pkg" \
+    --htmldir="$DL/$pkg" \
+    --dvidir="$DL/$pkg" \
+    --pdfdir="$DL/$pkg" \
+    --psdir="$DL/$pkg" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --disable-option-checking \
+    --enable-silent-rules \
+    --disable-dependency-tracking \
+    --disable-shared \
+    --enable-static \
+    --disable-fast-install \
+    --disable-libtool-lock \
+    --disable-multithreading \
+    --disable-lz4 \
+    --disable-lzma \
+    --disable-debug \
+    --disable-werror \
+    --disable-fuzzing \
+    --disable-s3 \
+    --disable-oci \
+    --disable-fuse \
+    --with-gnu-ld \
+    --with-sysroot="$SYSROOT" \
+    --without-zlib \
+    --with-libzstd \
+    --without-libdeflate \
+    --without-qpl \
+    --without-xxhash \
+    --without-libcurl \
+    --without-openssl \
+    --without-libxml2 \
+    --without-json-c \
+    --without-libnl3 \
+    --without-selinux \
+    CC=gcc \
+    CFLAGS="-Os -ffunction-sections -fdata-sections -w -I$INCLUDE" \
+    LDFLAGS="-static -Wl,--gc-sections -L$LIB" \
+    LIBS='-lm -lc' \
+    PKG_CONFIG="$BIN/pkg-config" \
+    PKG_CONFIG_PATH="$LIB/pkgconfig" \
+    PKG_CONFIG_LIBDIR="$LIB/pkgconfig" \
+    PKG_CONFIG_SYSROOT_DIR="$SYSROOT" \
+    libuuid_CFLAGS="-I$INCLUDE" \
+    libuuid_LIBS="-L$LIB -luuid" \
+    zlib_CFLAGS="-I$INCLUDE" \
+    zlib_LIBS="-L$LIB -lz" \
+    libzstd_CFLAGS="-I$INCLUDE" \
+    libzstd_LIBS="-L$LIB -lzstd" > /dev/null || die "Unable to configure '$app'"
+  make --directory=lib -j "$(nproc)" > /dev/null || die "Unable to build '$app lib'"
+  make --directory=mkfs -j "$(nproc)" LDFLAGS="-all-static -L$LIB" > /dev/null || die "Unable to build '$app mkfs'"
+  strip mkfs/mkfs.erofs || die "Unable to strip 'mkfs.erofs' executable."
+  mv mkfs/mkfs.erofs "$BIN/mkfs.erofs" || die "Unable to move 'mkfs.erofs' executable to '$BIN'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# Build `mkfs.erofs` — MaKe File System • Enhanced Read-Only File System
+_mkfs_erofs() {
+  _cp_tools
+  _make
+  _m4
+  _perl
+  _autoconf
+  _automake
+  _libtool
+  _pkg_config
+  _zlib
+  _zstd
+  _util_linux
+  _erofs_utils
+}
+
+# LuaJIT is a Just-In-Time (JIT) compiler for the Lua programming language.
+# curl -skLSJO https://github.com/LuaJIT/LuaJIT/archive/refs/tags/v2.1.ROLLING.tar.gz
+#
+# mkdir -p ~/pkg/LuaJIT-2.1
+# cp /var/tmp/sysroot/bin/luajit ~/pkg/LuaJIT-2.1
+# mkfs.erofs -z zstd ~/pkg/LuaJIT-2.1.erofs ~/pkg/LuaJIT-2.1
+# mkdir -p ~/LuaJIT-2.1
+# mount -t erofs -o ro ~/pkg/LuaJIT-2.1.erofs ~/LuaJIT-2.1
+# umount ~/LuaJIT-2.1
+_luajit() {
+  [ -f "$BIN/luajit" ] && return
+  app="luajit"
+  ver="2.1"
+  pkg="LuaJIT-${ver}.ROLLING"
+  ext="tar.gz"
+  url="https://github.com/LuaJIT/LuaJIT/archive/refs/tags/v$ver.ROLLING.tar.gz"
+  des="LuaJIT is a Just-In-Time (JIT) compiler for the Lua programming language"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  make -j "$(nproc)" \
+    CC=gcc \
+    HOST_CC=gcc \
+    STATIC_CC=gcc \
+    CROSS='x86_64-linux-musl-' \
+    HOST_SYS='Linux' \
+    TARGET_SYS='Linux' \
+    CFLAGS='-O2' \
+    HOST_CFLAGS='-O2' \
+    TARGET_CFLAGS='-O2' \
+    LDFLAGS='-static' \
+    HOST_LDFLAGS='-static' \
+    TARGET_LDFLAGS='-static' \
+    XCFLAGS='-DLUAJIT_DISABLE_GC64' \
+    PREFIX="$SYSROOT" \
+    INSTALL_BIN="$BIN" \
+    INSTALL_LIB="$LIB" \
+    INSTALL_INC="$INCLUDE" > /dev/null || die "Unable to build '$app'"
+  strip src/luajit || die "Unable to strip '$app' executable."
+  mv src/luajit "$BIN" || die "Unable to move '$app' executable to '$BIN'"
+##make install PREFIX="$SYSROOT" INSTALL_BIN="$BIN" INSTALL_LIB="$LIB" INSTALL_INC="$INCLUDE" > /dev/null || \
+  die "Unable to install '$app', libraries and header files."
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# musl — an implementation of the standard library for Linux-based systems
+# 
+# Note:
+# Rob Landley's prebuilt x86_64 musl-libc cross-compiler ships libc.a
+# without -fPIC, so it can't link into a -static-pie binary.
+# So we rebuild musl with -fPIC/-fPIE to produce a PIE-capable rcrt1.o
+#
+# curl -skLSJO https://musl.libc.org/releases/musl-1.2.5.tar.gz
+# curl -skLSJO https://git.musl-libc.org/cgit/musl/snapshot/musl-1.2.5.tar.gz
+_musl() {
+##[ -f "$SYSROOT/x86_64-linux-musl/lib/rcrt1.o" ] && return
+  app="musl"
+  ver="1.2.5"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://musl.libc.org/releases/$pkg.$ext"
+  des="musl libc, rebuilt with -fPIC/-fPIE so static-pie links against it work"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT/x86_64-linux-musl" \
+    --exec-prefix="$SYSROOT/x86_64-linux-musl" \
+    --bindir="$SYSROOT/x86_64-linux-musl/bin" \
+    --libdir="$SYSROOT/x86_64-linux-musl/lib" \
+    --includedir="$SYSROOT/x86_64-linux-musl/include" \
+    --syslibdir="$SYSROOT/x86_64-linux-musl/lib" \
+    --target='x86_64-linux-musl' \
+    --build='x86_64-linux-gnu' \
+    --enable-wrapper=no \
+    --with-malloc=mallocng \
+    CC="$BIN/x86_64-linux-musl-gcc" \
+    CFLAGS='-O2 -fPIC -fPIE' \
+    CROSS_COMPILE='x86_64-linux-musl-' > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" > /dev/null || die "Unable to build '$app'"
+  make install > /dev/null || die "Unable to install '$app'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# OpenResty Branch of LuaJIT 2
+# Required by 'lua-nginx-module' 'lua-resty-core'
+# 
+# Note:
+# Building OpenResty's LuaJIT fork with -fPIC/-fPIE against musl's
+# PIE-capable rcrt1.o, so libluajit-5.1.a links cleanly into the
+# static-pie OpenResty binary.
+#
+# curl -skLSJO https://github.com/openresty/luajit2/archive/refs/tags/v2.1-20250117.tar.gz
+# curl -skLSJO https://github.com/openresty/luajit2/archive/refs/tags/v2.1-20250826.tar.gz
+# curl -skLSJO https://github.com/openresty/luajit2/archive/refs/tags/v2.1-20260717.tar.gz
+_luajit2() {
+  [ -f "$LIB/libluajit-5.1.a" ] && \
+  [ -f "$INCLUDE/luajit.h" ] && \
+  [ -f "$INCLUDE/lua.h" ] && \
+  return
+  app="luajit2"
+  ver="2.1-20250117"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://github.com/openresty/luajit2/archive/refs/tags/v$ver.$ext"
+  des="OpenResty Branch of LuaJIT 2"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  make -j "$(nproc)" \
+    BUILDMODE=static \
+    CC=gcc \
+    HOST_CC=gcc \
+    STATIC_CC=gcc \
+    CROSS='x86_64-linux-musl-' \
+    HOST_SYS='Linux' \
+    TARGET_SYS='Linux' \
+    CFLAGS='-O2 -fPIC -fPIE' \
+    HOST_CFLAGS='-O2' \
+    TARGET_CFLAGS='-O2 -fPIC -fPIE' \
+    LDFLAGS='-static' \
+    HOST_LDFLAGS='-static' \
+    TARGET_LDFLAGS='-static-pie -Wl,-E' \
+    XCFLAGS='-DLUAJIT_DISABLE_GC64' \
+    PREFIX="$SYSROOT" \
+    INSTALL_BIN="$BIN" \
+    INSTALL_LIB="$LIB" \
+    INSTALL_INC="$INCLUDE" > /dev/null || die "Unable to build '$app'"
+##strip src/luajit-2.1* || die "Unable to strip '$app' executable."
+##cp src/luajit-2.1 "$BIN" || die "Unable to copy '$DL/$pkg/src/luajit-2.1' to '$BIN'"
+  make install PREFIX="$SYSROOT" INSTALL_BIN="$BIN" INSTALL_LIB="$LIB" INSTALL_INC="$INCLUDE" > /dev/null || \
+  die "Unable to install '$app', libraries and header files."
+  unlink $BIN/luajit || die "Unable to unlink existing 'luajit'"
+  rm $BIN/luajit-2.1* || die "Unable to remove existing '$BIN/luajit-2.1*'"
+  rm -rf "$SHARE/man/man1" || die "Unable to remove '$SHARE/man/man1'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# PCRE library is a set of C functions that implement regular expression pattern matching.
+# libpcre.a : Required by OpenResty for URL routing, location matching, rewrite rules.
+# This build yields `pcre-config` `pcregrep` `pcretest`
+#
+# Note:
+# Building PCRE with -fPIC/-fPIE against musl's PIE-capable rcrt1.o,
+# so libpcre.a links cleanly into the static-pie OpenResty binary.
+#
+# curl -skLSJO https://sourceforge.net/projects/pcre/files/pcre/8.45/pcre-8.45.tar.gz
+_pcre() {
+  [ -f "$LIB/libpcre.a" ] && \
+  [ -f "$INCLUDE/pcre.h" ] && \
+  [ -f "$LIB/pkgconfig/libpcre.pc" ] && \
+  return
+  _musl
+  app="pcre"
+  ver="8.45"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://sourceforge.net/projects/pcre/files/pcre/$ver/$pkg.$ext"
+  des="Perl Compatible Regular Expression library — legacy PCRE1"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --infodir="$DL/$pkg/tmp" \
+    --mandir="$DL/$pkg/tmp" \
+    --docdir="$DL/$pkg/tmp" \
+    --htmldir="$DL/$pkg/tmp" \
+    --dvidir="$DL/$pkg/tmp" \
+    --pdfdir="$DL/$pkg/tmp" \
+    --psdir="$DL/$pkg/tmp" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --enable-silent-rules \
+    --disable-dependency-tracking \
+    --enable-static \
+    --disable-shared \
+    --disable-fast-install \
+    --disable-libtool-lock \
+    --enable-pcre16=no \
+    --enable-pcre32=no \
+    --disable-cpp \
+    --enable-jit \
+    --disable-pcregrep-jit \
+    --enable-utf8 \
+    --enable-unicode-properties \
+    --enable-newline-is-lf \
+    --disable-valgrind \
+    --disable-coverage \
+    --with-gnu-ld \
+    --with-sysroot="$SYSROOT" \
+    --with-link-size=2 \
+    --with-parens-nest-limit=250 \
+    --with-match-limit=10000000 \
+    --with-match-limit-recursion=10000000 \
+    CC="$BIN/x86_64-linux-musl-gcc" \
+    CFLAGS='-O2 -fPIC -fPIE' \
+    LDFLAGS='-static-pie -Wl,-E' \
+    LIBS='-lm -lc' \
+    PKG_CONFIG="$BIN/pkg-config" \
+    PKG_CONFIG_PATH="$LIB/pkgconfig" \
+    PKG_CONFIG_LIBDIR="$LIB/pkgconfig" > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" > /dev/null || die "Unable to build '$app'"
+  make install > /dev/null || die "Unable to install '$app'"
+  rm -rf "$DL/$pkg"
+}
+
+# PCRE2 library is a set of C functions that implement regular expression pattern matching.
+# libpcre2.a : Required by NGINX for URL routing, location matching, rewrite rules.
+# curl -skLSJO https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.47/pcre2-10.47.tar.gz
+# curl -skLSJO https://sourceforge.net/projects/pcre/files/pcre/8.45/pcre-8.45.tar.gz
+# pcre2-config pcre2grep pcre2test
+_pcre2() {
+  [ -f "$LIB/libpcre2-8.a" ] && \
+  [ -f "$LIB/libpcre2-posix.a" ] && \
+  [ -f "$INCLUDE/pcre2.h" ] && \
+  [ -f "$INCLUDE/pcre2posix.h" ] && \
+  [ -f "$LIB/pkgconfig/libpcre2-8.pc" ] && \
+  [ -f "$LIB/pkgconfig/libpcre2-posix.pc" ] && \
+  return
+  app="pcre2"
+  ver="10.47"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://github.com/PCRE2Project/$app/releases/download/$pkg/$pkg.$ext"
+  des="Perl Compatible Regular Expression library"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+  ./configure \
+    --prefix="$SYSROOT" \
+    --infodir="$DL/$pkg/tmp" \
+    --mandir="$DL/$pkg/tmp" \
+    --docdir="$DL/$pkg/tmp" \
+    --htmldir="$DL/$pkg/tmp" \
+    --dvidir="$DL/$pkg/tmp" \
+    --pdfdir="$DL/$pkg/tmp" \
+    --psdir="$DL/$pkg/tmp" \
+    --build='x86_64-linux-musl' \
+    --host='x86_64-linux-musl' \
+    --enable-silent-rules \
+    --disable-dependency-tracking \
+    --enable-static \
+    --disable-shared \
+    --disable-fast-install \
+    --disable-libtool-lock \
+    --disable-symvers \
+    --enable-pcre2-8 \
+    --disable-pcre2-16 \
+    --disable-pcre2-32 \
+    --disable-jit \
+    --disable-pcre2grep-callout \
+    --disable-pcre2grep-callout-fork \
+    --enable-unicode \
+    --enable-newline-is-lf \
+    --enable-never-backslash-C \
+    --disable-valgrind \
+    --disable-coverage \
+    --disable-fuzz-support \
+    --disable-diff-fuzz-support \
+    --with-gnu-ld \
+    --with-sysroot="$SYSROOT" \
+    --with-link-size=2 \
+    --with-parens-nest-limit=250 \
+    --with-heap-limit=20000000 \
+    --with-match-limit=10000000 \
+    --with-match-limit-depth=10000000 \
+    CC=gcc \
+    CFLAGS='-O2' \
+    LDFLAGS='-static' \
+    LIBS='-lm -lc' \
+    PKG_CONFIG="$BIN/pkg-config" \
+    PKG_CONFIG_PATH="$LIB/pkgconfig" \
+    PKG_CONFIG_LIBDIR="$LIB/pkgconfig" > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" > /dev/null || die "Unable to build '$app'"
+  make install > /dev/null || die "Unable to install '$app'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+# zlib — A massively spiffy yet delicately unobtrusive compression library.
+# curl -skLSJO https://zlib.net/zlib-1.3.2.tar.gz
+_extract_zlib() {
+  app="zlib"
+  ver="1.3.2"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://zlib.net/$pkg.$ext"
+  des="A compression/decompression Library"
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+}
+
+# NGINX — A Web Server, high performance Load Balancer, Reverse Proxy, API Gateway and Content Cache.
+# curl -skLSJO https://nginx.org/download/nginx-1.30.3.tar.gz
+#
+# mkdir -p ~/pkg/nginx-1.30.3/sbin/
+# cp /var/tmp/sysroot/bin/nginx ~/pkg/nginx-1.30.3/sbin
+# mkfs.erofs -z zstd ~/pkg/nginx-1.30.3.erofs ~/pkg/nginx-1.30.3/sbin/nginx
+# mkdir -p ~/webapp/nginx-1.30.3/sbin/
+# mount -t erofs -o ro ~/pkg/nginx-1.30.3.erofs ~/webapp/nginx-1.30.3/sbin
+# umount ~/sysroot/mnt/nginx-1.30.3
+_openresty() {
+##[ -f "$BIN/nginx" ] && return
+  app="openresty"
+  ver="1.27.1.2"
+  pkg="${app}-${ver}"
+  ext="tar.gz"
+  url="https://github.com/openresty/openresty/releases/download/v${ver}/${pkg}.${ext}"
+  des="Nginx + LuaJIT + ngx_lua + lua-resty-core, as an officially matched bundle"
+
+  ngx_ver="${ver%.*}"
+  zlib="zlib-1.3.2"
+  
+  WEBAPP="/var/tmp/webapp"
+
+  [ -f "$DL/$pkg.$ext" ] || curl -skLSJ "$url" -o "$DL/$pkg.$ext" || die "Unable to download '$pkg.$ext'"
+  rm -rf "$DL/$pkg" || die "Unable to remove existing '$DL/$pkg' source tree."
+  tar -xf "$DL/$pkg.$ext" -C "$DL" || die "Unable to extract '$DL/$pkg.$ext'"
+  cd "$DL/$pkg" || die "Unable to switch to '$DL/$pkg' source tree."
+
+cat <<EoP | patch -p1 || die "Unable to patch to '$DL/$pkg/bundle/nginx-${ngx_ver}/auto/cc/name'"
+--- a/bundle/nginx-${ngx_ver}/auto/cc/name
++++ b/bundle/nginx-${ngx_ver}/auto/cc/name
+@@ -7,6 +7,6 @@
+ if [ "\$NGX_PLATFORM" != win32 ]; then
+     ngx_feature="C compiler"
+     ngx_feature_name=
+-    ngx_feature_run=yes
++    ngx_feature_run=no
+     ngx_feature_incs=
+     ngx_feature_path=
+EoP
+
+
+cat <<'EoP' | patch -p1 || die "Unable to patch to '$DL/$pkg/bundle/nginx-1.27.1/auto/types/sizeof'"
+--- a/bundle/nginx-1.27.1/auto/types/sizeof
++++ b/bundle/nginx-1.27.1/auto/types/sizeof
+@@ -39,10 +39,14 @@
+ eval "$ngx_test >> $NGX_AUTOCONF_ERR 2>&1"
+ 
+ 
+-if [ -x $NGX_AUTOTEST ]; then
+-    ngx_size=`$NGX_AUTOTEST`
+-    echo " $ngx_size bytes"
+-fi
++case $ngx_type in
++    int) ngx_size=4 ;;
++    long) ngx_size=8 ;;
++    "long long") ngx_size=8 ;;
++    "void *") ngx_size=8 ;;
++    *) ngx_size=4 ;;
++esac
++echo " $ngx_size bytes (hardcoded x86_64, cross-compiling)"
+ 
+ 
+ case $ngx_size in
+EoP
+
+  
+  [ -d "$WEBAPP" ] || mkdir -p "$WEBAPP" || die "Unable to create '$WEBAPP' directory."
+
+  LUAJIT_LIB="$LIB" \
+  LUAJIT_INC="$INCLUDE" \
+  PKG_CONFIG_PATH="$LIB/pkgconfig" \
+  ./configure \
+    --with-luajit="$SYSROOT" \
+    --prefix="$WEBAPP/$pkg" \
+    --sbin-path="$WEBAPP/$pkg/bin/openresty" \
+    --conf-path="$WEBAPP/$pkg/conf/nginx.conf" \
+    --error-log-path="$WEBAPP/$pkg/log/error.log" \
+    --pid-path="$WEBAPP/$pkg/conf/nginx.pid" \
+    --lock-path="$WEBAPP/$pkg/conf/nginx.lock" \
+    \
+    --without-lua_cjson \
+    --without-lua_redis_parser \
+    --without-lua_rds_parser \
+    --without-lua_resty_memcached \
+    --without-lua_resty_mysql \
+    --without-lua_resty_upload \
+    --without-lua_resty_upstream_healthcheck \
+    --without-lua_resty_websocket \
+    --without-lua_resty_limit_traffic \
+    --without-lua_resty_signal \
+    --without-lua_resty_shell \
+    \
+    --without-http_xss_module \
+    --without-http_coolkit_module \
+    --without-http_set_misc_module \
+    --without-http_form_input_module \
+    --without-http_encrypted_session_module \
+    --without-http_srcache_module \
+    --without-http_headers_more_module \
+    --without-http_array_var_module \
+    --without-http_memc_module \
+    --without-http_rds_json_module \
+    --without-http_rds_csv_module \
+    --without-stream_lua_module \
+    \
+    --without-http_ssl_module \
+    --without-stream \
+    \
+    --without-lua_resty_memcached \
+    --without-lua_resty_mysql \
+    --without-lua_resty_upload \
+    --without-lua_resty_upstream_healthcheck \
+    --without-lua_resty_websocket \
+    --without-lua_resty_limit_traffic \
+    --without-lua_resty_signal \
+    --without-lua_resty_shell \
+    \
+    --http-log-path="$WEBAPP/$pkg/log/access.log" \
+    --http-client-body-temp-path="$WEBAPP/$pkg/temp/client_body" \
+    --http-proxy-temp-path="$WEBAPP/$pkg/temp/proxy" \
+    --http-fastcgi-temp-path="$WEBAPP/$pkg/temp/fastcgi" \
+    --http-uwsgi-temp-path="$WEBAPP/$pkg/temp/uwsgi" \
+    --http-scgi-temp-path="$WEBAPP/$pkg/temp/scgi" \
+    \
+    --with-threads \
+    \
+    --without-http_charset_module \
+    --without-http_ssi_module \
+    --without-http_userid_module \
+    --without-http_autoindex_module \
+    --without-http_geo_module \
+    --without-http_map_module \
+    --without-http_split_clients_module \
+    --without-http_referer_module \
+    --without-http_fastcgi_module \
+    --without-http_uwsgi_module \
+    --without-http_scgi_module \
+    --without-http_grpc_module \
+    --without-http_memcached_module \
+    --without-http_limit_conn_module \
+    --without-http_limit_req_module \
+    --without-http_empty_gif_module \
+    --without-http_browser_module \
+    --without-http_upstream_hash_module \
+    --without-http_upstream_ip_hash_module \
+    --without-http_upstream_least_conn_module \
+    --without-http_upstream_random_module \
+    --without-http_upstream_keepalive_module \
+    --without-http_upstream_zone_module \
+    \
+    --without-mail_pop3_module \
+    --without-mail_imap_module \
+    --without-mail_smtp_module \
+    \
+    --with-cc="$BIN/x86_64-linux-musl-gcc" \
+    --with-cc-opt="-Os -ffunction-sections -fdata-sections -fPIE -I$INCLUDE" \
+    --with-ld-opt="-static-pie -Wl,-E -L$LIB -lpcre" \
+    --with-pcre-jit \
+    --with-zlib="$DL/$zlib" > /dev/null || die "Unable to configure '$app'"
+  make -j "$(nproc)" > /dev/null || die "Unable to build '$app'"
+  strip "build/nginx-${ngx_ver}/objs/nginx" || die "Unable to strip '$DL/$pkg/build/nginx-${ngx_ver}/objs/nginx' executable."
+##make install || die "Unable to install '$app'"
+  mkdir -p "$WEBAPP/$pkg/temp/client_body/" || die "Unable to create '$WEBAPP/$pkg/temp/client_body' directory."
+  mkdir -p "$WEBAPP/$pkg/temp/proxy/" || die "Unable to create '$WEBAPP/$pkg/temp/proxy' directory."
+  mkdir -p "$WEBAPP/$pkg/temp/fastcgi/" || die "Unable to create '$WEBAPP/$pkg/temp/fastcgi' directory."
+  mkdir -p "$WEBAPP/$pkg/temp/uwsgi/" || die "Unable to create '$WEBAPP/$pkg/temp/uwsgi' directory."
+  mkdir -p "$WEBAPP/$pkg/temp/scgi/" || die "Unable to create '$WEBAPP/$pkg/temp/scgi' directory."
+  rm -rf "$DL/$zlib" || die "Unable to remove '$DL/$zlib'"
+  rm -rf "$DL/$pkg" || die "Unable to remove '$DL/$pkg'"
+}
+
+_lua_nginx() {
+  _cp_tools
+  _make
+  _m4
+  _pkg_config
+  _perl
+  _autoconf
+  _automake
+##_libressl_lib
+  _musl
+  _pcre
+  _luajit2
+  _extract_zlib
+  _openresty
+}
+
+case "${1}" in
+  mk_build_swap)         _mk_build_swap          ;;
+  rm_build_swap)         _rm_build_swap          ;;
+  setup_docker)          _setup_docker           ;;
+  setup_docker_rootless) _setup_docker_rootless  ;;
+  lite_os_inn_docker)    _lite_os_inn_docker     ;;
+  dl_alpine)             _dl_alpine              ;;
+  dl_bwrap)              _dl_bwrap               ;;
+  inn_sandbox)           _inn_sandbox $@         ;;
+  cp_tools)              _cp_tools               ;;
+  make)                  _make                   ;;
+  bash)                  _bash                   ;;
+  libressl_lib)          _libressl_lib           ;;
+  libssh2_lib)           _libssh2_lib            ;;
+  libressl_curl)         _libressl_curl          ;;
+  wolfssl_lib)           _wolfssl_lib            ;;
+  wolfssl_curl)          _wolfssl_curl           ;;
+  xmake)                 _xmake                  ;;
+  m4)                    _m4                     ;;
+  bison)                 _bison                  ;;
+  flex)                  _flex                   ;;
+  argp_standalone)       _argp_standalone        ;;
+  musl_fts)              _musl_fts               ;;
+  musl_obstack)          _musl_obstack           ;;
+  pkg_config)            _pkg_config             ;;
+  zlib)                  _zlib                   ;;
+  elfutils)              _elfutils               ;;
+  zstd)                  _zstd                   ;;
+  toybox)                _toybox                 ;;
+  lite_os)               _lite_os                ;;
+  lite_os_ami)           _lite_os_ami            ;;
+  perl)                  _perl                   ;;
+  autoconf)              _autoconf               ;;
+  automake)              _automake               ;;
+  libtool)               _libtool                ;;
+  util_linux)            _util_linux             ;;
+  erofs_utils)           _erofs_utils            ;;
+  mkfs_erofs)            _mkfs_erofs             ;;
+  luajit)                _luajit                 ;;
+  musl)                  _musl                   ;;
+  luajit2)               _luajit2                ;;
+  pcre)                  _pcre                   ;;
+  extract_zlib)          _extract_zlib           ;;
+  openresty)             _openresty              ;;
+  pcre2)                 _pcre2                  ;;
+  lua_nginx)             _lua_nginx              ;;
+  *)
+    echo "Usage: $0 xmake|lite_os|mkfs_erofs|luajit|lua_nginx"
+    exit 1
+    ;;
+esac
+
+echo "Build time: $(date -d@$(($(date +%s)-START)) -u +%H:%M:%S)"
+

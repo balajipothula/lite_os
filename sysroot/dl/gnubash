@@ -1,0 +1,64 @@
+#!/bin/echo Try "mkroot/mkroot.sh gnubash"
+# Overlay file, adding GNU bash
+echo === download source
+download f55ec1fd62ae33f1b8bf4eb6527e0fa53363e481 \
+  https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz
+echo === $HOST Native build static gnubash
+setupfor bash
+CC=${CROSS_COMPILE}gcc /bin/bash \
+./configure \
+  CFLAGS="-static -no-pie -fno-pie -Os -fdata-sections -ffunction-sections -Wno-implicit-function-declaration -s -std=gnu99" \
+  LDFLAGS="-static -no-pie -Wl,--gc-sections" \
+  --prefix=/usr \
+  --host=x86_64-linux-musl \
+  --disable-nls \
+  --disable-rpath \
+  --disable-largefile \
+  --disable-threads \
+  --with-gnu-ld \
+  --without-bash-malloc \
+  --without-libiconv-prefix \
+  --without-libintl-prefix \
+  --without-afs \
+  --without-curses \
+  --without-installed-readline \
+  --enable-static-link \
+  --enable-readline \
+  --enable-progcomp \
+  --enable-alias \
+  --enable-array-variables \
+  --enable-bang-history \
+  --enable-brace-expansion \
+  --enable-command-timing \
+  --enable-cond-command \
+  --enable-cond-regexp \
+  --enable-directory-stack \
+  --enable-dparen-arithmetic \
+  --enable-extended-glob \
+  --enable-history \
+  --enable-job-control \
+  --enable-process-substitution \
+  --enable-prompt-string-decoding \
+  --enable-select \
+  --enable-year2038 \
+  --disable-alt-array-implementation \
+  --disable-casemod-attributes \
+  --disable-casemod-expansions \
+  --disable-coprocesses \
+  --disable-debugger \
+  --disable-disabled-builtins \
+  --disable-function-import \
+  --disable-help-builtin \
+  --disable-mem-scramble \
+  --disable-net-redirections \
+  --disable-profiling \
+  --disable-restricted \
+  --disable-separate-helpfiles \
+  --disable-single-help-strings \
+  --disable-translatable-strings \
+  --disable-xpg-echo-default > /dev/null || exit 1
+make -j $(nproc) > /dev/null || exit 1
+${CROSS_COMPILE}strip bash
+mkdir -p "$ROOT"/usr/bin || exit 1
+cp bash "$ROOT"/usr/bin/gnubash || exit 1
+cleanup
